@@ -787,6 +787,23 @@ pub(crate) fn normalize_agent_command_identity(command: &str) -> String {
         .collect()
 }
 
+/// Resolve the runtime identity for env defaults / Codex sandbox injection.
+///
+/// Household launchers (`acp-agent`) exec the real adapter via `--agent-args`.
+/// Matching only the launcher basename would skip `CODEX_CONFIG` network
+/// injection and Hermes MCP isolation on CMR (root-v18cs).
+pub(crate) fn resolve_runtime_identity(command: &str, agent_args: &[String]) -> String {
+    let command_id = normalize_agent_command_identity(command);
+    match command_id.as_str() {
+        "acp-agent" => agent_args
+            .iter()
+            .map(|arg| normalize_agent_command_identity(arg))
+            .find(|id| !id.is_empty())
+            .unwrap_or(command_id),
+        _ => command_id,
+    }
+}
+
 fn default_agent_args(command: &str) -> Option<Vec<String>> {
     match normalize_agent_command_identity(command).as_str() {
         "goose" => Some(vec!["acp".to_string()]),
@@ -1139,14 +1156,29 @@ impl Config {
 
         // Inject CODEX_CONFIG so the @agentclientprotocol/codex-acp adapter (1.x)
         // opens the Seatbelt network sandbox for buzz-cli (an MCP subprocess). No-op
-        // for non-Codex agents or unparseable relay URLs.
+        // for non-Codex agents or unparseable relay URLs. Resolve through launcher
+        // args so `--agent-command acp-agent --agent-args codex` still matches.
+        let runtime_identity = resolve_runtime_identity(&agent_command, &agent_args);
         let has_generated_codex_config =
-            if let Some(network_env) = codex_network_env(&agent_command, &args.relay_url) {
+            if let Some(network_env) = codex_network_env(&runtime_identity, &args.relay_url) {
                 persona_env_vars.push(network_env);
                 true
             } else {
                 false
             };
+
+        // Agent-side `buzz` CLI calls inherit this. Prefer https derived from wss
+        // so wrappers that default to `http://` do not 405 on the public relay
+        // (root-v18cs / CMR). Operator-set BUZZ_RELAY_URL still wins at spawn.
+        // Inline ws→http (same rules as relay::relay_ws_to_http) to avoid a
+        // config↔relay dependency cycle at this layer.
+        let http_relay = args
+            .relay_url
+            .replace("wss://", "https://")
+            .replace("ws://", "http://")
+            .trim_end_matches('/')
+            .to_string();
+        persona_env_vars.push(("BUZZ_RELAY_URL".into(), http_relay));
 
         validate_multiple_event_handling(args.multiple_event_handling, args.dedup)?;
 
@@ -1761,6 +1793,41 @@ mod tests {
                 "non-Hermes command must have no env defaults: {command}"
             );
         }
+    }
+
+    #[test]
+    fn resolve_runtime_identity_unwraps_acp_agent_launcher_args() {
+        assert_eq!(
+            resolve_runtime_identity("/opt/buzz/bin/acp-agent", &["codex".into()]),
+            "codex"
+        );
+        assert_eq!(
+            resolve_runtime_identity("acp-agent", &["qwen".into()]),
+            "qwen"
+        );
+        assert_eq!(
+            resolve_runtime_identity("acp-agent", &["hermes".into()]),
+            "hermes"
+        );
+        // Non-launcher commands keep their own identity even with args.
+        assert_eq!(
+            resolve_runtime_identity("/usr/bin/codex-acp", &["ignored".into()]),
+            "codex-acp"
+        );
+        assert_eq!(resolve_runtime_identity("acp-agent", &[]), "acp-agent");
+    }
+
+    #[test]
+    fn codex_network_env_matches_launcher_resolved_codex_identity() {
+        let identity = resolve_runtime_identity("acp-agent", &["codex".into()]);
+        let result = codex_network_env(&identity, "wss://buzz.lymarinc.com");
+        assert!(
+            result.is_some(),
+            "acp-agent + codex args must still inject CODEX_CONFIG"
+        );
+        let (key, value) = result.unwrap();
+        assert_eq!(key, "CODEX_CONFIG");
+        assert!(value.contains("network_access"));
     }
 
     #[test]

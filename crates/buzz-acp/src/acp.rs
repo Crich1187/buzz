@@ -496,8 +496,10 @@ impl AcpClient {
         // Per-runtime environment defaults (e.g. Hermes MCP-startup isolation).
         // Applied first so both persona `extra_env` (below, via `Command::env`
         // key replacement) and inherited parent env (via the parent-presence
-        // check) override them.
-        for &(key, value) in crate::config::default_agent_env(command) {
+        // check) override them. Resolve through launcher args so
+        // `acp-agent hermes` still gets Hermes defaults (root-v18cs).
+        let runtime_identity = crate::config::resolve_runtime_identity(command, args);
+        for &(key, value) in crate::config::default_agent_env(&runtime_identity) {
             if std::env::var_os(key).is_none() {
                 cmd.env(key, value);
             }
