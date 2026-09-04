@@ -313,26 +313,40 @@ pub(crate) async fn run_demo_echo(
     let peer = inbound.from;
     let mut stream = inbound.stream;
     tracing::info!(%session_id, %peer, "mesh demo echo: session open");
-    let mut drain_tick = tokio::time::interval(std::time::Duration::from_millis(100));
     loop {
-        let frame = tokio::select! {
-            _ = drain_tick.tick() => {
-                if shutting_down.load(Ordering::Relaxed) {
-                    if let Some(community_id) = stream.community_id() {
-                        if let Err(e) = stream.send_goodbye(community_id, GoodbyeReason::Draining).await {
-                            tracing::warn!(%session_id, "mesh demo echo: draining goodbye failed: {e}");
-                        } else {
-                            tracing::info!(%session_id, "mesh demo echo: sent draining goodbye");
-                        }
-                    } else {
-                        let _ = stream.finish();
-                        tracing::info!(%session_id, "mesh demo echo: drain before community latch — closing");
-                    }
-                    return;
+        if shutting_down.load(Ordering::Relaxed) {
+            if let Some(community_id) = stream.community_id() {
+                if let Err(e) = stream
+                    .send_goodbye(community_id, GoodbyeReason::Draining)
+                    .await
+                {
+                    tracing::warn!(%session_id, "mesh demo echo: draining goodbye failed: {e}");
+                } else {
+                    tracing::info!(%session_id, "mesh demo echo: sent draining goodbye");
                 }
-                continue;
+            } else {
+                let _ = stream.finish();
+                tracing::info!(
+                    %session_id,
+                    "mesh demo echo: drain before community latch — closing"
+                );
             }
-            frame = stream.recv_validated(&directory) => frame,
+            return;
+        }
+
+        // Poll shutdown between bounded recv waits. Do **not** `select!` a drain
+        // tick against `recv_validated`: when both are Ready, the tick branch can
+        // win and drop a fully-read Data frame, and the forwarder 504s. A timed
+        // recv either yields Ok(frame) or cancels while Pending (bytes remain
+        // buffered for the next iteration).
+        let frame = match tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            stream.recv_validated(&directory),
+        )
+        .await
+        {
+            Ok(frame) => frame,
+            Err(_) => continue,
         };
         match frame {
             Ok(Some(ReliableFrame::Data(payload))) => {
