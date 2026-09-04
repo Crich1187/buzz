@@ -5466,15 +5466,20 @@ async fn spawn_and_init(
         .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
     acp.set_observer(observer, agent_index);
 
+    let init_started = std::time::Instant::now();
     match acp.initialize().await {
         Ok(init_result) => {
-            tracing::info!("agent initialized: {init_result}");
+            tracing::info!(
+                elapsed_ms = init_started.elapsed().as_millis() as u64,
+                "agent initialized: {init_result}"
+            );
             let protocol_version = init_result["protocolVersion"].as_u64().unwrap_or(1) as u32;
             acp.observe(
                 "agent_initialized",
                 serde_json::json!({
                     "agentIndex": agent_index,
                     "initializeResult": init_result,
+                    "elapsedMs": init_started.elapsed().as_millis() as u64,
                 }),
             );
             let agent_name = normalized_agent_name(&init_result);
@@ -5484,8 +5489,11 @@ async fn spawn_and_init(
             // Explicitly shut down the spawned child to prevent zombie/leak.
             // Drop only does start_kill + try_wait (best-effort); shutdown()
             // does start_kill + bounded wait (guaranteed reap).
+            let elapsed_ms = init_started.elapsed().as_millis() as u64;
             acp.shutdown().await;
-            Err(anyhow::anyhow!("agent initialize failed: {e}"))
+            Err(anyhow::anyhow!(
+                "agent initialize failed after {elapsed_ms}ms: {e}"
+            ))
         }
     }
 }
@@ -5826,10 +5834,12 @@ done"#
 
     #[test]
     fn models_default_timeout_exceeds_legacy_ten_seconds() {
-        assert!(
-            DEFAULT_MODELS_TIMEOUT_SECS > 10,
-            "default must clear the legacy 10s false-negative window"
-        );
+        const {
+            assert!(
+                DEFAULT_MODELS_TIMEOUT_SECS > 10,
+                "default must clear the legacy 10s false-negative window"
+            );
+        }
         assert_eq!(
             models_handshake_timeout(DEFAULT_MODELS_TIMEOUT_SECS),
             Duration::from_secs(90)

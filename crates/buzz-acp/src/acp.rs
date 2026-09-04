@@ -497,7 +497,7 @@ impl AcpClient {
         // Applied first so both persona `extra_env` (below, via `Command::env`
         // key replacement) and inherited parent env (via the parent-presence
         // check) override them.
-        for &(key, value) in crate::config::default_agent_env(command) {
+        for &(key, value) in crate::config::default_agent_env(command, args) {
             if std::env::var_os(key).is_none() {
                 cmd.env(key, value);
             }
