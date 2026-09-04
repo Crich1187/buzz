@@ -2453,20 +2453,21 @@ async fn handle_ws_message(
                     }
 
                     // CLOSED needs cleanup and resubscribe, not just logging.
-                    let is_auth_error = message.starts_with("auth-required")
-                        || message.starts_with("restricted")
-                        || message.contains("auth");
+                    let force_reconnect = closed_requires_full_reconnect(&message);
+                    let is_database_error = message.contains("database error");
                     warn!(
                         "subscription {subscription_id} closed by relay: {message}{}",
-                        if is_auth_error {
+                        if is_database_error {
+                            " [database error — reconnect required]"
+                        } else if force_reconnect {
                             " [auth error — reconnect required]"
                         } else {
                             ""
                         }
                     );
 
-                    if is_auth_error {
-                        // Auth errors require a full reconnect (re-handshake).
+                    if force_reconnect {
+                        // Auth / database errors require a full reconnect.
                         return false;
                     }
 
@@ -3726,6 +3727,17 @@ const CHANNEL_ACCESS_DENIED_REASONS: &[&str] = &[
     "restricted: not a channel member",
     "restricted: channel access revoked",
 ];
+
+/// Whether a CLOSED message means the whole connection must re-handshake.
+///
+/// Auth denials and relay `database error` closes both leave subscriptions
+/// unreliable if we only re-REQ on the existing socket (root-e919r).
+fn closed_requires_full_reconnect(message: &str) -> bool {
+    message.starts_with("auth-required")
+        || message.starts_with("restricted")
+        || message.contains("auth")
+        || message.contains("database error")
+}
 
 /// Handle a CLOSED that denies access to a single channel: drop just that
 /// channel's subscription (the proven Unsubscribe cleanup) and keep the socket.
@@ -5366,6 +5378,19 @@ mod tests {
             !state.active_filters.contains_key(&channel_id),
             "channel state must be cleared (Unsubscribe cleanup)"
         );
+    }
+
+    #[test]
+    fn closed_database_error_requires_full_reconnect() {
+        assert!(closed_requires_full_reconnect("error: database error"));
+        assert!(closed_requires_full_reconnect("auth-required"));
+        assert!(closed_requires_full_reconnect(
+            "restricted: insufficient scope"
+        ));
+        assert!(!closed_requires_full_reconnect(
+            "rate-limited: shared admission unavailable"
+        ));
+        assert!(!closed_requires_full_reconnect("shutdown"));
     }
 
     #[test]

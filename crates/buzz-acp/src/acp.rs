@@ -750,7 +750,9 @@ impl AcpClient {
 
     /// Send `session/prompt` with idle-based timeout instead of wall-clock.
     ///
-    /// The idle deadline resets on any stdout activity from the agent. The hard
+    /// The idle deadline resets on *meaningful* agent activity (tool calls,
+    /// streamed assistant text, permission requests) — not on thought chunks,
+    /// keepalives, or other low-signal `session/update` types. The hard
     /// deadline is an absolute wall-clock cap (safety valve).
     pub async fn session_prompt_with_idle_timeout(
         &mut self,
@@ -1292,8 +1294,11 @@ impl AcpClient {
     /// either of two timeouts fires. Returns `Result<value, IdleTimeout |
     /// HardTimeout | other>`.
     ///
-    /// - `idle_timeout`: silent-agent guard, **reset on every line of valid
-    ///   JSON** (and explicitly on `session/update` notifications).
+    /// - `idle_timeout`: silent-agent guard. Reset only on meaningful
+    ///   activity selected by [`Self::handle_session_update`] (and on
+    ///   permission / agent-initiated requests we handle) — **not** on every
+    ///   valid JSON line. Thought chunks and keepalives must not keep a hung
+    ///   turn alive past the idle budget (root-e919r / partial-message spam).
     /// - `hard_deadline`: absolute wall-clock cap on the whole call, passed
     ///   in so that `cancel_with_cleanup` can inherit the remaining budget
     ///   from the original turn rather than starting a fresh timer.
@@ -1559,9 +1564,11 @@ impl AcpClient {
                     };
                     self.observe("acp_read", msg.clone());
 
-                    let activity_now = Instant::now();
-                    idle_deadline = activity_now + idle_timeout;
-                    last_activity_at = activity_now;
+                    // Do NOT reset idle on every valid JSON line. Streaming
+                    // thought/keepalive/partial spam would otherwise pin the
+                    // idle clock forever and leave mentions queued behind a
+                    // hung turn (root-e919r). Meaningful resets happen below
+                    // via handle_session_update / permission / agent requests.
 
                     // Steer response routing must come BEFORE the prompt
                     // response check: a steer response is a regular
@@ -1699,13 +1706,19 @@ impl AcpClient {
                                     let activity_now = Instant::now();
                                     idle_deadline = activity_now + idle_timeout;
                                     last_activity_at = activity_now;
-                                    tracing::debug!("idle clock reset: tool call started");
+                                    tracing::debug!("idle clock reset: meaningful session/update");
                                 }
                             }
                             "_goose/unstable/session/update" => {
                                 self.handle_goose_usage_update(&msg);
                             }
                             "session/request_permission" => {
+                                // Permission round-trips are real progress —
+                                // reset idle so a quiet agent waiting on us
+                                // is not killed mid-handshake.
+                                let activity_now = Instant::now();
+                                idle_deadline = activity_now + idle_timeout;
+                                last_activity_at = activity_now;
                                 self.handle_permission_request(&msg).await?;
                             }
                             other => {
@@ -1757,7 +1770,9 @@ impl AcpClient {
                 if let Some(text) = update["content"]["text"].as_str() {
                     tracing::info!(target: "acp::stream", "{text}");
                 }
-                false
+                // Streamed assistant text is meaningful progress — reset idle.
+                // Thought chunks / keepalives below intentionally do not.
+                true
             }
             "tool_call" => {
                 let title = update
@@ -3188,11 +3203,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_resets_on_stdout_activity() {
-        // Send valid JSON (session/update notifications) to reset the idle timer.
-        // Non-JSON lines no longer reset idle — only valid JSON notifications do.
+    async fn idle_resets_on_assistant_message_chunks() {
+        // Streamed assistant text resets idle; thought/keepalive must not
+        // (see thought_chunks_do_not_reset_idle / keepalive_does_not_reset_idle).
         let mut client = spawn_script(
-            r#"for i in $(seq 1 10); do echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_thought_chunk","content":{"text":"thinking"}}}}'; sleep 0.05; done; sleep 10"#,
+            r#"for i in $(seq 1 10); do echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"x"}}}}'; sleep 0.05; done; sleep 10"#,
         )
         .await;
         let max_dur = std::time::Duration::from_secs(10);
@@ -3211,6 +3226,33 @@ mod tests {
         // 10 messages × 50ms = ~500ms of activity, then idle timeout fires after 200ms more
         assert!(elapsed >= std::time::Duration::from_millis(400));
         assert!(elapsed < std::time::Duration::from_secs(3));
+        assert!(matches!(result, Err(AcpError::IdleTimeout(_))));
+    }
+
+    #[tokio::test]
+    async fn thought_chunks_do_not_reset_idle() {
+        // agent_thought_chunk spam must not pin the idle clock (root-e919r).
+        let mut client = spawn_script(
+            r#"for i in $(seq 1 20); do echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_thought_chunk","content":{"text":"thinking"}}}}'; sleep 0.05; done; sleep 10"#,
+        )
+        .await;
+        let max_dur = std::time::Duration::from_secs(10);
+        let hard_deadline = tokio::time::Instant::now() + max_dur;
+        let start = std::time::Instant::now();
+        let result = client
+            .read_until_response_with_idle_timeout(
+                "test",
+                999,
+                std::time::Duration::from_millis(150),
+                hard_deadline,
+                max_dur,
+            )
+            .await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "thought chunks must not extend idle; elapsed {elapsed:?}"
+        );
         assert!(matches!(result, Err(AcpError::IdleTimeout(_))));
     }
 
@@ -3385,9 +3427,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keepalive_resets_idle_past_deadline() {
-        // Keepalive session/update lines every 50ms against a 100ms idle deadline.
-        // The turn should survive well past the 100ms deadline (proves the fix).
+    async fn keepalive_does_not_reset_idle() {
+        // Keepalive session/update must NOT pin the idle clock (root-e919r).
+        // handle_session_update returns false for keepalive; without the old
+        // blanket JSON reset, idle fires near the deadline despite spam.
         let mut client = spawn_script(
             r#"for i in $(seq 1 20); do echo '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"keepalive"}}}'; sleep 0.05; done; sleep 10"#,
         )
@@ -3405,21 +3448,18 @@ mod tests {
             )
             .await;
         let elapsed = start.elapsed();
-        // 20 keepalives × 50ms = ~1000ms of activity, then idle fires after 100ms more.
-        // Must survive well past the 100ms deadline.
         assert!(
-            elapsed >= std::time::Duration::from_millis(500),
-            "keepalive should reset idle past the deadline; elapsed only {elapsed:?}"
+            elapsed < std::time::Duration::from_millis(400),
+            "keepalive must not reset idle; elapsed {elapsed:?}"
         );
-        assert!(elapsed < std::time::Duration::from_secs(5));
         assert!(matches!(result, Err(AcpError::IdleTimeout(_))));
     }
 
     #[tokio::test]
     async fn tool_call_resets_idle_then_silence_times_out() {
-        // A tool_call session/update resets the idle timer (belt-and-suspenders path),
-        // then silence causes idle timeout. This proves the reset works for tool_call
-        // specifically — not just via the general valid-JSON reset at line 839.
+        // A tool_call session/update resets the idle timer (handle_session_update
+        // returns true), then silence causes idle timeout. This proves the reset
+        // works for tool_call specifically — not via a blanket valid-JSON reset.
         //
         // The script emits a tool_call, waits 80ms (under the 200ms idle), then goes
         // silent. If the tool_call reset didn't fire, idle would fire at 200ms from
