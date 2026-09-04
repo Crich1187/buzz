@@ -210,6 +210,26 @@ impl SessionDirectory {
         }
     }
 
+    /// Delete lease + generation keys for one session.
+    ///
+    /// Used by mesh-demo / directory tests to keep Redis fixtures deterministic
+    /// without flushing shared databases or changing production key layout.
+    #[cfg(test)]
+    pub(crate) async fn clear_session_keys(
+        &self,
+        community_id: CommunityId,
+        session_id: Uuid,
+    ) -> Result<(), DirectoryError> {
+        let keys = SessionKeys::new(community_id, session_id);
+        let mut conn = self.pool.get().await?;
+        let _: () = redis::cmd("DEL")
+            .arg(&keys.lease)
+            .arg(&keys.generation)
+            .query_async(&mut *conn)
+            .await?;
+        Ok(())
+    }
+
     async fn begin_serving_write(
         &self,
         community_id: CommunityId,
