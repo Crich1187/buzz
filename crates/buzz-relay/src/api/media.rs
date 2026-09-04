@@ -1131,15 +1131,30 @@ mod tests {
     }
 
     async fn test_state() -> Arc<AppState> {
+        // Host-bound media tests require current communities schema (including
+        // deletion_state from migration 0029). Prefer the shared test URL and
+        // migrate unless a pre-applied desired schema is explicitly selected.
+        const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1 -- local test-only credentials
         let mut config = crate::config::Config::from_env().expect("default config loads");
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
         config.media_uploads_per_minute = 1;
         config.media_max_concurrent_uploads = 2;
         config.media_max_concurrent_uploads_per_pubkey = 1;
+        config.database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("TEST_DATABASE_URL"))
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| TEST_DB_URL.to_string());
 
-        let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
+        let pool = sqlx::PgPool::connect(&config.database_url)
+            .await
+            .expect("connect media test DB");
         let db = buzz_db::Db::from_pool(pool.clone());
+        if std::env::var("BUZZ_TEST_SCHEMA_MODE").as_deref() != Ok("desired") {
+            db.migrate()
+                .await
+                .expect("migrate media test DB to current schema");
+        }
         db.ensure_configured_community("relay.example")
             .await
             .expect("seed relay.example community for host-bound media tests");
@@ -1172,6 +1187,41 @@ mod tests {
             media_storage,
         );
         Arc::new(state)
+    }
+
+    /// root-6mu08: host-bound media fixture must see `communities.deletion_state`
+    /// before seeding `relay.example` (current schema parity).
+    #[tokio::test]
+    async fn media_test_fixture_exposes_communities_deletion_state() {
+        let state = test_state().await;
+        let pool = sqlx::PgPool::connect(&state.config.database_url)
+            .await
+            .expect("reconnect media fixture DB for schema probe");
+        let present: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'communities'
+                  AND column_name = 'deletion_state'
+            )
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("query communities.deletion_state presence");
+        assert!(
+            present,
+            "media test fixture must migrate current communities.deletion_state"
+        );
+        let seeded = state
+            .db
+            .lookup_community_by_host("relay.example")
+            .await
+            .expect("lookup seeded relay.example")
+            .expect("relay.example community row after fixture seed");
+        assert_eq!(seeded.host, "relay.example");
     }
 
     async fn media_get_auth_router() -> axum::Router {
