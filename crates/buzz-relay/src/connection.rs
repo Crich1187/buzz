@@ -744,6 +744,486 @@ pub(crate) mod tests {
         assert_eq!(frame[3], "rate-limited: too many concurrent requests");
     }
 
+    // ---------------------------------------------------------------------
+    // root-jk1sw Major 1 — isolated multi-agent mention-burst analogue.
+    //
+    // The prior candidate proved only admission *classification* while every
+    // handler permit was held: under that condition subscriptions necessarily
+    // close, so it could not speak to the bead's acceptance criterion
+    // ("subscriptions stay up through a multi-agent mention burst without
+    // database-error closes").
+    //
+    // This fixture inverts that: capacity is configured the way the immutable
+    // unit ships it (pool 50 / handlers 45), several agent connections each open
+    // several subscriptions, and a burst of mention EVENTs is dispatched
+    // concurrently through the real `handle_text_message`. The assertions are on
+    // survival and on the absence of `error: database error`, with explicit
+    // nonzero denominators printed so a reviewer can see what was actually
+    // exercised.
+    //
+    // Live relay proof remains Gate 4; this is the in-repo analogue.
+    // ---------------------------------------------------------------------
+
+    /// Agents in the burst.
+    const BURST_AGENTS: usize = 8;
+    /// Subscriptions each agent opens.
+    const BURST_SUBS_PER_AGENT: usize = 3;
+    /// Mention events published per agent.
+    const BURST_EVENTS_PER_AGENT: usize = 8;
+
+    /// An authenticated connection bound to a specific agent keypair and to the
+    /// community the burst fixture actually seeded, so REQ/EVENT resolve against
+    /// real tenant rows instead of the nil community.
+    fn burst_conn(
+        keys: &Keys,
+        community: buzz_core::tenant::CommunityId,
+    ) -> (Arc<ConnectionState>, mpsc::Receiver<WsMessage>) {
+        let (send_tx, send_rx) = mpsc::channel(1024);
+        let (ctrl_tx, _ctrl_rx) = mpsc::channel(64);
+        let conn = ConnectionState {
+            conn_id: Uuid::new_v4(),
+            tenant: TenantContext::resolved(community, "relay.example".to_string()),
+            remote_addr: "127.0.0.1:1234".parse().expect("socket addr"),
+            auth_state: RwLock::new(AuthState::Authenticated(AuthContext {
+                pubkey: keys.public_key(),
+                scopes: Vec::new(),
+                channel_ids: None,
+                auth_method: AuthMethod::Nip42,
+                agent_owner_pubkey: None,
+            })),
+            subscriptions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            send_tx,
+            ctrl_tx,
+            cancel: CancellationToken::new(),
+            backpressure_count: Arc::new(AtomicU8::new(0)),
+            grace_limit: 3,
+        };
+        (Arc::new(conn), send_rx)
+    }
+
+    /// Isolated logical Redis DB for burst tests (root-kd5gc convention:
+    /// never share DB 0 with the live relay or other suites).
+    const BURST_REDIS_DB: u32 = 14;
+
+    fn burst_redis_url() -> String {
+        if let Ok(url) = std::env::var("BUZZ_TEST_BURST_REDIS_URL") {
+            let trimmed = url.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+        format!("redis://127.0.0.1:6379/{BURST_REDIS_DB}")
+    }
+
+    fn burst_database_url() -> String {
+        // Same resolution order as the root-6mu08 media fixture.
+        const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1 -- local test-only credentials
+        std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("TEST_DATABASE_URL"))
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| TEST_DB_URL.to_string())
+    }
+
+    /// Relay state with *working* backing stores and production-shaped capacity.
+    ///
+    /// Returns `None` with an explicit reason when the isolated dependencies are
+    /// unavailable, so the burst never silently degrades into a vacuous pass.
+    async fn burst_state() -> Option<(Arc<crate::state::AppState>, buzz_core::tenant::CommunityId)>
+    {
+        let mut config = crate::config::Config::from_env().expect("default config loads");
+        config.require_relay_membership = false;
+        config.database_url = burst_database_url();
+        config.redis_url = burst_redis_url();
+        // Exactly what deploy/host/pepper/buzz-relay.service ships.
+        config.db_pool_size = 50;
+        config.max_concurrent_handlers = crate::config::handler_capacity_for_pool(50);
+        assert_eq!(config.max_concurrent_handlers, 45);
+
+        // Build the pool at the configured size, so the fixture actually
+        // exercises the capacity relationship it claims to. Connecting with
+        // sqlx's defaults here would silently ignore `db_pool_size` and make the
+        // burst insensitive to the very invariant under test.
+        let pool = match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(config.db_pool_size)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect(&config.database_url)
+            .await
+        {
+            Ok(pool) => pool,
+            Err(err) => {
+                eprintln!("burst skip: test postgres unavailable: {err}");
+                return None;
+            }
+        };
+        let db = buzz_db::Db::from_pool(pool.clone());
+        if let Err(err) = db.migrate().await {
+            eprintln!("burst skip: migrate failed: {err}");
+            return None;
+        }
+        let community = match db.ensure_configured_community("relay.example").await {
+            Ok(record) => record.id,
+            Err(err) => {
+                eprintln!("burst skip: seed community failed: {err}");
+                return None;
+            }
+        };
+        let redis_pool = match deadpool_redis::Config::from_url(&config.redis_url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+        {
+            Ok(p) => p,
+            Err(err) => {
+                eprintln!("burst skip: redis pool create failed (db={BURST_REDIS_DB}): {err}");
+                return None;
+            }
+        };
+        match redis_pool.get().await {
+            Ok(mut conn) => {
+                if redis::cmd("PING")
+                    .query_async::<String>(&mut *conn)
+                    .await
+                    .is_err()
+                {
+                    eprintln!("burst skip: redis PING failed (db={BURST_REDIS_DB})");
+                    return None;
+                }
+            }
+            Err(err) => {
+                eprintln!("burst skip: redis unavailable (db={BURST_REDIS_DB}): {err}");
+                return None;
+            }
+        }
+        let pubsub =
+            match buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone()).await {
+                Ok(p) => Arc::new(p),
+                Err(err) => {
+                    eprintln!("burst skip: pubsub manager failed: {err}");
+                    return None;
+                }
+            };
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
+        let (state, _audit_shutdown) = crate::state::AppState::new(
+            config,
+            db,
+            redis_pool,
+            audit,
+            pubsub,
+            auth,
+            search,
+            workflow_engine,
+            nostr::Keys::generate(),
+            media_storage,
+        );
+        Some((Arc::new(state), community))
+    }
+
+    /// Drain every frame a connection has been sent so far.
+    fn drain_frames(rx: &mut mpsc::Receiver<WsMessage>) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let WsMessage::Text(text) = msg {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                    out.push(value);
+                }
+            }
+        }
+        out
+    }
+
+    /// AC proof: subscriptions survive a concurrent multi-agent mention burst
+    /// and nothing closes with `error: database error`.
+    #[tokio::test]
+    async fn multi_agent_mention_burst_keeps_subscriptions_up_without_database_errors() {
+        let Some((state, community)) = burst_state().await else {
+            // A skipped burst must never read as a pass in CI. Setting
+            // BUZZ_TEST_BURST_REQUIRE=1 turns an unavailable dependency into a
+            // failure instead of a silent green.
+            assert!(
+                std::env::var("BUZZ_TEST_BURST_REQUIRE").as_deref() != Ok("1"),
+                "BUZZ_TEST_BURST_REQUIRE=1 but the burst dependencies were unavailable"
+            );
+            return;
+        };
+
+        // Every agent is a distinct connection with its own keypair, mirroring
+        // the buzz-acp fleet shape that produced the incident.
+        let mut agents = Vec::new();
+        for _ in 0..BURST_AGENTS {
+            let keys = Keys::generate();
+            let (conn, rx) = burst_conn(&keys, community);
+            agents.push((keys, conn, rx));
+        }
+
+        // Phase 1 — open subscriptions.
+        let mut opened = 0usize;
+        for (agent_idx, (_keys, conn, _rx)) in agents.iter().enumerate() {
+            for sub_idx in 0..BURST_SUBS_PER_AGENT {
+                let sub_id = format!("burst-a{agent_idx}-s{sub_idx}");
+                let raw =
+                    serde_json::json!(["REQ", sub_id, {"kinds": [1], "limit": 1}]).to_string();
+                handle_text_message(raw, Arc::clone(conn), Arc::clone(&state)).await;
+                opened += 1;
+            }
+        }
+        assert!(opened > 0, "denominator: no subscriptions were opened");
+
+        // Subscription registration happens inside the spawned handler; give the
+        // whole cohort a bounded window to land before asserting.
+        let mut registered = 0usize;
+        for _ in 0..200 {
+            registered = 0;
+            for (_keys, conn, _rx) in &agents {
+                registered += conn.subscriptions.lock().await.len();
+            }
+            if registered == opened {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            registered, opened,
+            "all {opened} subscriptions must be registered before the burst"
+        );
+
+        // Phase 2 — concurrent mention burst across every agent.
+        let mut published = 0usize;
+        let mut tasks = Vec::new();
+        for (agent_idx, (keys, conn, _rx)) in agents.iter().enumerate() {
+            for event_idx in 0..BURST_EVENTS_PER_AGENT {
+                // Mention the *next* agent, so every agent is both author and
+                // recipient — the shape of a fleet mention storm.
+                let target = &agents[(agent_idx + 1) % BURST_AGENTS].0;
+                let event = EventBuilder::new(
+                    Kind::TextNote,
+                    format!("burst mention a{agent_idx}-e{event_idx}"),
+                )
+                .tag(nostr::Tag::public_key(target.public_key()))
+                .sign_with_keys(keys)
+                .expect("sign burst event");
+                let raw = serde_json::json!(["EVENT", event]).to_string();
+                let conn = Arc::clone(conn);
+                let state = Arc::clone(&state);
+                tasks.push(tokio::spawn(async move {
+                    handle_text_message(raw, conn, state).await;
+                }));
+                published += 1;
+            }
+        }
+        assert!(published > 0, "denominator: no events were published");
+        for task in tasks {
+            task.await.expect("burst dispatch task");
+        }
+
+        // Let spawned handlers settle.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Phase 3 — assertions with explicit denominators.
+        let mut frames_seen = 0usize;
+        let mut database_error_closes = Vec::new();
+        let mut closed_sub_ids = Vec::new();
+        for (_keys, _conn, rx) in agents.iter_mut() {
+            for frame in drain_frames(rx) {
+                frames_seen += 1;
+                if frame[0] == "CLOSED" {
+                    let sub_id = frame[1].as_str().unwrap_or_default().to_string();
+                    let reason = frame[2].as_str().unwrap_or_default().to_string();
+                    if reason.contains("database error") {
+                        database_error_closes.push((sub_id.clone(), reason.clone()));
+                    }
+                    closed_sub_ids.push((sub_id, reason));
+                }
+            }
+        }
+
+        let mut still_open = 0usize;
+        for (_keys, conn, _rx) in &agents {
+            still_open += conn.subscriptions.lock().await.len();
+        }
+
+        eprintln!(
+            "burst denominators: agents={BURST_AGENTS} subscriptions_opened={opened} \
+events_published={published} frames_observed={frames_seen} \
+subscriptions_still_open={still_open} closed_frames={} database_error_closes={}",
+            closed_sub_ids.len(),
+            database_error_closes.len()
+        );
+
+        assert!(
+            frames_seen > 0,
+            "denominator: the burst produced no observable frames"
+        );
+        assert!(
+            database_error_closes.is_empty(),
+            "subscriptions closed with a database error during the mention burst: {database_error_closes:?}"
+        );
+        assert_eq!(
+            still_open, opened,
+            "all {opened} subscriptions must stay up through the burst; \
+closed frames were: {closed_sub_ids:?}"
+        );
+    }
+
+    /// Non-vacuity control for the burst assertion.
+    ///
+    /// The burst asserts "no subscription closed with `error: database error`".
+    /// An assertion like that is only worth anything if the condition it forbids
+    /// is reachable by the same code path, so this test drives the identical
+    /// dispatch against an unreachable database and requires that the forbidden
+    /// close *does* appear. If this test ever goes green-by-absence, the burst's
+    /// guarantee has silently stopped meaning anything.
+    #[tokio::test]
+    async fn burst_database_error_close_is_reachable_when_the_database_is_down() {
+        let keys = Keys::generate();
+        // `test_state` deliberately builds a lazy pool against the configured
+        // URL and an unreachable Redis; pointing the pool at a dead port makes
+        // every handler DB call fail on connect.
+        let mut config = crate::config::Config::from_env().expect("default config loads");
+        config.require_relay_membership = false;
+        // Admission must succeed so the request actually reaches the database
+        // layer; only the database is taken away.
+        config.redis_url = burst_redis_url();
+        config.database_url = "postgres://buzz:buzz_dev@127.0.0.1:1/buzz".to_string(); // sadscan:disable np.postgres.1 -- unreachable-by-design test DSN
+                                                                                       // Short acquire timeout so the unreachable database surfaces as a fast
+                                                                                       // acquire failure instead of sitting on sqlx's 30s default.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(config.db_pool_size)
+            .acquire_timeout(std::time::Duration::from_millis(500))
+            .connect_lazy(&config.database_url)
+            .expect("lazy pg pool");
+        let db = buzz_db::Db::from_pool(pool.clone());
+        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("redis pool");
+        let pubsub = Arc::new(
+            buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                .await
+                .expect("pubsub manager"),
+        );
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
+        let (state, _audit_shutdown) = crate::state::AppState::new(
+            config,
+            db,
+            redis_pool,
+            audit,
+            pubsub,
+            auth,
+            search,
+            workflow_engine,
+            nostr::Keys::generate(),
+            media_storage,
+        );
+        let state = Arc::new(state);
+
+        let (conn, mut rx) = burst_conn(
+            &keys,
+            buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
+        );
+        let raw = serde_json::json!(["REQ", "down-probe", {"kinds": [1], "limit": 1}]).to_string();
+        handle_text_message(raw, Arc::clone(&conn), Arc::clone(&state)).await;
+
+        let mut database_error_seen = false;
+        let mut frames_seen = 0usize;
+        let mut observed: Vec<String> = Vec::new();
+        for _ in 0..200 {
+            for frame in drain_frames(&mut rx) {
+                frames_seen += 1;
+                observed.push(frame.to_string());
+                if frame[0] == "CLOSED"
+                    && frame[2]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("database error")
+                {
+                    database_error_seen = true;
+                }
+            }
+            if database_error_seen {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        eprintln!(
+            "burst control denominators: frames_observed={frames_seen} database_error_seen={database_error_seen} observed={observed:?}"
+        );
+        assert!(
+            database_error_seen,
+            "the burst's forbidden condition must be reachable; with the database \
+down a REQ has to close with `error: database error` (frames seen: {frames_seen})"
+        );
+    }
+
+    /// Companion to the burst: when the shared admission store is unreachable
+    /// the relay must classify the refusal as rate-limiting, never as a
+    /// database error. This is the third symptom on the bead
+    /// ("rate-limited: shared admission unavailable") and it must stay on the
+    /// admission side of the split.
+    ///
+    /// Gate3 M1: this must *induce* admission unavailability and require the
+    /// exact CLOSED refusal — a successful REQ/EOSE must not vacuous-pass.
+    #[tokio::test]
+    async fn admission_unavailable_never_reports_a_database_error() {
+        // `test_state` points Redis at 127.0.0.1:1, so shared admission fails
+        // closed as Unavailable (same seam as rejection::enforce_against_unreachable_admission).
+        let state = crate::state::tests::test_state().await;
+        let (conn, mut rx) = test_conn_with_auth(authenticated_state());
+
+        let raw = serde_json::json!(["REQ", "admission-probe", {"kinds": [1]}]).to_string();
+        handle_text_message(raw, Arc::clone(&conn), Arc::clone(&state)).await;
+
+        // Admission refusal is synchronous in the WS loop (no spawn) — expect
+        // the CLOSED frame immediately.
+        let mut frames = Vec::new();
+        for _ in 0..80 {
+            frames.extend(drain_frames(&mut rx));
+            if frames.iter().any(|f| f[0] == "CLOSED") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        let closed: Vec<_> = frames
+            .iter()
+            .filter(|f| f[0] == "CLOSED")
+            .cloned()
+            .collect();
+        assert!(
+            !closed.is_empty(),
+            "denominator: admission-unavailable probe must produce a CLOSED frame \
+             (got frames={frames:?})"
+        );
+        let mut saw_admission_unavailable = false;
+        for frame in &closed {
+            assert_eq!(frame[1], "admission-probe");
+            let reason = frame[2].as_str().unwrap_or_default();
+            assert!(
+                !reason.contains("database error"),
+                "admission unavailability must not be reported as a database error, got {reason:?}"
+            );
+            if reason.contains("shared admission unavailable") || reason.contains("rate-limited") {
+                saw_admission_unavailable = true;
+            }
+        }
+        assert!(
+            saw_admission_unavailable,
+            "CLOSED reason must be the admission refusal, not a success path \
+             (closed={closed:?})"
+        );
+    }
+
     /// The REQ arm of the same branch still settles on CLOSED.
     #[tokio::test]
     async fn saturated_handler_rejects_a_req_on_the_closed_channel() {

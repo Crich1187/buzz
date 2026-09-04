@@ -113,6 +113,86 @@ impl std::fmt::Debug for KlipyConfig {
 /// WebSocket close-frame delivery after the final delayed cancellation.
 pub const MAX_DRAIN_JITTER_MS: u64 = 20_000;
 
+/// Postgres connections held back from message handlers (root-jk1sw).
+///
+/// Health checks, the audit worker, NIP-11/admin reads, and pool housekeeping
+/// all acquire from the same writer pool as request handlers. If admission is
+/// allowed to schedule handlers up to the full pool size, those background
+/// acquires are the ones that time out, and a REQ that loses the race closes
+/// its subscription with `error: database error` (`handlers/req.rs`) — the
+/// exact symptom this bead exists to remove.
+pub const HANDLER_POOL_RESERVED_CONNECTIONS: u32 = 5;
+
+/// Concurrent `query_events` calls one multi-filter REQ may have in flight.
+///
+/// Mirrors `crate::handlers::req::FILTER_QUERY_CONCURRENCY`; duplicated here as
+/// a `pub` constant so the capacity invariant is expressible in `config` without
+/// a module cycle. `handler_pool_invariant` asserts the two stay equal.
+pub const REQUEST_DB_FANOUT: usize = 4;
+
+/// Largest handler concurrency that keeps admitted work inside the writer pool.
+///
+/// Bounds *requests*, not database acquires: one admitted handler may itself
+/// fan out to [`REQUEST_DB_FANOUT`] concurrent reads. See
+/// [`handler_pool_invariant`] for what this does and does not guarantee.
+///
+/// Pools at or below [`HANDLER_POOL_RESERVED_CONNECTIONS`] cannot reserve
+/// headroom and still admit handlers — this returns **0** (no-handler /
+/// fail-start). Never use `saturating_sub(reserved).max(1)`, which would
+/// violate `handlers + reserved <= pool`.
+pub fn handler_capacity_for_pool(db_pool_size: u32) -> usize {
+    if db_pool_size <= HANDLER_POOL_RESERVED_CONNECTIONS {
+        return 0;
+    }
+    usize::try_from(db_pool_size - HANDLER_POOL_RESERVED_CONNECTIONS).unwrap_or(usize::MAX)
+}
+
+/// The bounded relationship between admitted handlers and the writer pool.
+///
+/// `handlers <= db_pool_size - HANDLER_POOL_RESERVED_CONNECTIONS` is what the
+/// configuration enforces. It guarantees that *one connection per in-flight
+/// handler* exists, which is what removes the steady-state `error: database
+/// error` closes: no handler can be admitted for which the pool has no
+/// connection at all.
+///
+/// It deliberately does **not** guarantee that every acquire is immediate. A
+/// multi-filter REQ fans out to up to [`REQUEST_DB_FANOUT`] concurrent reads, so
+/// the worst-case simultaneous acquire demand is
+/// `handlers * REQUEST_DB_FANOUT`, which exceeds the pool. That excess is
+/// absorbed as *waiting* on the pool, not as failure: sqlx queues acquires and
+/// the fan-out is itself bounded per request, so the queue is finite and drains.
+/// Sizing the cap at `(pool - reserved) / REQUEST_DB_FANOUT` instead would hold
+/// throughput at single digits for a pool of 50 and was rejected; the tradeoff
+/// is recorded here rather than left implicit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HandlerPoolInvariant {
+    /// Handlers the relay will admit concurrently.
+    pub handlers: usize,
+    /// Writer-pool size the handlers draw from.
+    pub db_pool_size: u32,
+    /// Connections reserved for non-handler work.
+    pub reserved: u32,
+    /// Worst-case simultaneous acquires if every handler fans out maximally.
+    pub worst_case_acquires: usize,
+}
+
+/// Describe the capacity relationship for a resolved configuration.
+pub fn handler_pool_invariant(handlers: usize, db_pool_size: u32) -> HandlerPoolInvariant {
+    HandlerPoolInvariant {
+        handlers,
+        db_pool_size,
+        reserved: HANDLER_POOL_RESERVED_CONNECTIONS,
+        worst_case_acquires: handlers.saturating_mul(REQUEST_DB_FANOUT),
+    }
+}
+
+impl HandlerPoolInvariant {
+    /// Every admitted handler has a pool connection available to it.
+    pub fn handlers_within_pool(&self) -> bool {
+        u32::try_from(self.handlers).is_ok_and(|h| h + self.reserved <= self.db_pool_size)
+    }
+}
+
 /// Relay runtime configuration, loaded from environment variables.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -605,6 +685,16 @@ impl Config {
             .and_then(|v| v.parse::<u32>().ok())
             .filter(|&v| v > 0)
             .unwrap_or(50);
+        // root-jk1sw M2: pools that cannot reserve headroom and still admit at
+        // least one handler must fail-start — never silently collapse to a
+        // one-handler ceiling that violates `handlers + reserved <= pool`.
+        if db_pool_size <= HANDLER_POOL_RESERVED_CONNECTIONS {
+            return Err(ConfigError::InvalidValue(format!(
+                "BUZZ_DB_POOL_SIZE={db_pool_size} is too small: must be greater than \
+                 HANDLER_POOL_RESERVED_CONNECTIONS ({HANDLER_POOL_RESERVED_CONNECTIONS}) \
+                 so reserved health/audit/admin capacity remains after handlers"
+            )));
+        }
 
         let db_read_pool_size = std::env::var("BUZZ_DB_READ_POOL_SIZE")
             .ok()
@@ -638,10 +728,33 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(10_000);
 
-        let max_concurrent_handlers = std::env::var("BUZZ_MAX_CONCURRENT_HANDLERS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1024);
+        // root-jk1sw: admission must never schedule more database-shaped work
+        // than the writer pool can own. The requested value is a ceiling, not a
+        // promise: it is clamped to `pool - HANDLER_POOL_RESERVED_CONNECTIONS`
+        // so background acquires (health, audit, admin) keep a connection and a
+        // REQ cannot lose an acquire race into `error: database error`.
+        let requested_max_concurrent_handlers: usize =
+            std::env::var("BUZZ_MAX_CONCURRENT_HANDLERS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1024);
+        let handler_capacity = handler_capacity_for_pool(db_pool_size);
+        if handler_capacity == 0 {
+            return Err(ConfigError::InvalidValue(format!(
+                "BUZZ_DB_POOL_SIZE={db_pool_size} yields zero handler capacity after \
+                 reserving {HANDLER_POOL_RESERVED_CONNECTIONS} connections (fail-start)"
+            )));
+        }
+        let max_concurrent_handlers = requested_max_concurrent_handlers.min(handler_capacity);
+        if max_concurrent_handlers < requested_max_concurrent_handlers {
+            tracing::warn!(
+                requested = requested_max_concurrent_handlers,
+                effective = max_concurrent_handlers,
+                db_pool_size,
+                reserved = HANDLER_POOL_RESERVED_CONNECTIONS,
+                "BUZZ_MAX_CONCURRENT_HANDLERS clamped to stay within the database pool"
+            );
+        }
 
         let send_buffer_size = std::env::var("BUZZ_SEND_BUFFER")
             .ok()
@@ -1847,6 +1960,162 @@ mod tests {
         assert_eq!(overridden, 80);
         assert_eq!(zero, 50, "zero must fall back to the default");
         assert_eq!(junk, 50, "unparsable value must fall back to the default");
+    }
+
+    /// root-jk1sw Major 2: the capacity contract is a pure function, so it is
+    /// asserted without touching process env.
+    #[test]
+    fn handler_capacity_reserves_headroom_under_the_pool() {
+        // Production shape: pool 50 keeps 5 back for health/audit/admin.
+        assert_eq!(handler_capacity_for_pool(50), 45);
+        // Smallest valid pool: reserved 5 + one handler.
+        assert_eq!(handler_capacity_for_pool(6), 1);
+        // Pools at or below the reservation yield no handlers (fail-start).
+        assert_eq!(handler_capacity_for_pool(5), 0);
+        assert_eq!(handler_capacity_for_pool(1), 0);
+        for pool in 1..=HANDLER_POOL_RESERVED_CONNECTIONS {
+            assert_eq!(
+                handler_capacity_for_pool(pool),
+                0,
+                "pool {pool} must not invent headroom via saturating_sub.max(1)"
+            );
+        }
+        for pool in (HANDLER_POOL_RESERVED_CONNECTIONS + 1)..=64 {
+            let handlers = handler_capacity_for_pool(pool);
+            assert!(
+                handlers >= 1,
+                "pool {pool} produced a zero handler capacity"
+            );
+            assert!(
+                handler_pool_invariant(handlers, pool).handlers_within_pool(),
+                "pool {pool} handlers={handlers} violates reserved headroom"
+            );
+        }
+    }
+
+    /// root-jk1sw M2: configuring a pool that cannot reserve headroom must
+    /// fail-start at Config::from_env, not silently accept.
+    #[test]
+    fn undersized_db_pool_is_rejected_at_config_load() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous = std::env::var_os("BUZZ_DB_POOL_SIZE");
+        for pool in 1..=HANDLER_POOL_RESERVED_CONNECTIONS {
+            std::env::set_var("BUZZ_DB_POOL_SIZE", pool.to_string());
+            let err = Config::from_env().expect_err("undersized pool must fail-start");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("too small") || msg.contains("zero handler capacity"),
+                "pool {pool} error should name the headroom failure, got {msg}"
+            );
+        }
+        if let Some(value) = previous {
+            std::env::set_var("BUZZ_DB_POOL_SIZE", value);
+        } else {
+            std::env::remove_var("BUZZ_DB_POOL_SIZE");
+        }
+    }
+
+    /// The previously shipped unit asked for 64 handlers against a pool of 50
+    /// while claiming to bound work "below the database pool". That exact
+    /// combination must now resolve to 45.
+    #[test]
+    fn requested_handlers_above_the_pool_are_clamped() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let pool = std::env::var_os("BUZZ_DB_POOL_SIZE");
+        let handlers = std::env::var_os("BUZZ_MAX_CONCURRENT_HANDLERS");
+        std::env::set_var("BUZZ_DB_POOL_SIZE", "50");
+        std::env::set_var("BUZZ_MAX_CONCURRENT_HANDLERS", "64");
+        let cfg = Config::from_env().expect("config");
+        if let Some(value) = pool {
+            std::env::set_var("BUZZ_DB_POOL_SIZE", value);
+        } else {
+            std::env::remove_var("BUZZ_DB_POOL_SIZE");
+        }
+        if let Some(value) = handlers {
+            std::env::set_var("BUZZ_MAX_CONCURRENT_HANDLERS", value);
+        } else {
+            std::env::remove_var("BUZZ_MAX_CONCURRENT_HANDLERS");
+        }
+        assert_eq!(cfg.db_pool_size, 50);
+        assert_eq!(
+            cfg.max_concurrent_handlers, 45,
+            "64 requested handlers against pool 50 must clamp to 45, not 64"
+        );
+        let invariant = handler_pool_invariant(cfg.max_concurrent_handlers, cfg.db_pool_size);
+        assert!(invariant.handlers_within_pool());
+    }
+
+    /// A request under the ceiling is honoured unchanged — the clamp is a
+    /// ceiling, not a rewrite.
+    #[test]
+    fn requested_handlers_below_the_ceiling_are_untouched() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let pool = std::env::var_os("BUZZ_DB_POOL_SIZE");
+        let handlers = std::env::var_os("BUZZ_MAX_CONCURRENT_HANDLERS");
+        std::env::set_var("BUZZ_DB_POOL_SIZE", "50");
+        std::env::set_var("BUZZ_MAX_CONCURRENT_HANDLERS", "12");
+        let cfg = Config::from_env().expect("config");
+        if let Some(value) = pool {
+            std::env::set_var("BUZZ_DB_POOL_SIZE", value);
+        } else {
+            std::env::remove_var("BUZZ_DB_POOL_SIZE");
+        }
+        if let Some(value) = handlers {
+            std::env::set_var("BUZZ_MAX_CONCURRENT_HANDLERS", value);
+        } else {
+            std::env::remove_var("BUZZ_MAX_CONCURRENT_HANDLERS");
+        }
+        assert_eq!(cfg.max_concurrent_handlers, 12);
+    }
+
+    /// The default 1024 handlers is meaningless against any realistic pool and
+    /// must be clamped even when the operator sets nothing at all.
+    #[test]
+    fn default_handler_ceiling_is_clamped_to_the_pool() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let pool = std::env::var_os("BUZZ_DB_POOL_SIZE");
+        let handlers = std::env::var_os("BUZZ_MAX_CONCURRENT_HANDLERS");
+        std::env::remove_var("BUZZ_MAX_CONCURRENT_HANDLERS");
+        std::env::set_var("BUZZ_DB_POOL_SIZE", "50");
+        let cfg = Config::from_env().expect("config");
+        if let Some(value) = pool {
+            std::env::set_var("BUZZ_DB_POOL_SIZE", value);
+        } else {
+            std::env::remove_var("BUZZ_DB_POOL_SIZE");
+        }
+        if let Some(value) = handlers {
+            std::env::set_var("BUZZ_MAX_CONCURRENT_HANDLERS", value);
+        }
+        assert_eq!(cfg.max_concurrent_handlers, 45);
+    }
+
+    /// root-jk1sw Major 2: state the bounded relationship explicitly rather
+    /// than letting `45 < 50` imply a guarantee it does not provide.
+    ///
+    /// What holds: one pool connection exists per admitted handler.
+    /// What does not: immediate acquire, because a multi-filter REQ fans out to
+    /// `REQUEST_DB_FANOUT` concurrent reads. This test pins both halves so a
+    /// future change to either constant has to restate the tradeoff.
+    #[test]
+    fn handler_pool_invariant_documents_request_fanout() {
+        // The duplicated constant must track the REQ handler's real fan-out.
+        assert_eq!(
+            REQUEST_DB_FANOUT,
+            crate::handlers::req::FILTER_QUERY_CONCURRENCY,
+            "config::REQUEST_DB_FANOUT drifted from handlers::req::FILTER_QUERY_CONCURRENCY"
+        );
+
+        let invariant = handler_pool_invariant(handler_capacity_for_pool(50), 50);
+        assert_eq!(invariant.handlers, 45);
+        assert_eq!(invariant.reserved, 5);
+        assert!(
+            invariant.handlers_within_pool(),
+            "every admitted handler must have a pool connection"
+        );
+        // Explicitly acknowledged: worst-case fan-out exceeds the pool and is
+        // absorbed as bounded waiting, not as failure.
+        assert_eq!(invariant.worst_case_acquires, 180);
+        assert!(invariant.worst_case_acquires > invariant.db_pool_size as usize);
     }
 
     #[test]
