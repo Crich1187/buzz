@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+#[cfg(test)]
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -916,24 +918,77 @@ pub(crate) mod tests {
         (Arc::new(conn), send_rx)
     }
 
-    /// Isolated logical Redis DB for burst tests (root-kd5gc convention:
-    /// never share DB 0 with the live relay or other suites).
+    /// Isolated logical Redis DB range for burst tests (root-kd5gc / root-jk1sw).
     ///
-    /// Gate3 continuation (root-jk1sw): a prior burst leaves fixed-window
-    /// admission counters on this DB; without a deterministic reset the next
-    /// full-suite burst can shed all writes (`writes_accepted=0`). Isolation
-    /// is `FLUSHDB` on **this logical DB only** — never DB 0 / never FLUSHALL —
-    /// and never weakens production admission controls.
-    const BURST_REDIS_DB: u32 = 14;
+    /// Gate3 FAIL on `48063b148` (cycle-2): a *shared* fixed DB + `FLUSHDB` races
+    /// when the two burst tests (and planted-key control) run under the default
+    /// parallel Rust harness — one fixture's reset wipes another's in-flight
+    /// admission counters → `writes_accepted=0` (vacuous). Each `burst_state()`
+    /// (and planted-key control) therefore:
+    /// 1. allocates a **unique nonzero** logical DB in `1..=15` (never DB 0 /
+    ///    never FLUSHALL), and
+    /// 2. holds [`BURST_REDIS_FIXTURE_LOCK`] for the fixture lifetime so a
+    ///    wraparound of the 15-DB cycle cannot collide with an in-flight peer.
+    ///
+    /// Admission controls themselves are unchanged.
+    const BURST_REDIS_DB_MIN: u32 = 1;
+    const BURST_REDIS_DB_MAX: u32 = 15;
+    static NEXT_BURST_REDIS_DB: AtomicU32 = AtomicU32::new(BURST_REDIS_DB_MIN);
+    /// Serializes fixtures that `FLUSHDB` a burst Redis DB (unique DB alone is
+    /// not enough once the 1..=15 allocator wraps under a parallel suite).
+    static BURST_REDIS_FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn burst_redis_url() -> String {
+    /// Lease held for the lifetime of a burst fixture that may FLUSHDB.
+    struct BurstRedisFixtureLease {
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    fn acquire_burst_redis_fixture_lease() -> BurstRedisFixtureLease {
+        BurstRedisFixtureLease {
+            _guard: BURST_REDIS_FIXTURE_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        }
+    }
+
+    /// Allocate the next nonzero Redis logical DB for a burst fixture.
+    ///
+    /// Cycles through `BURST_REDIS_DB_MIN..=BURST_REDIS_DB_MAX` (excludes 0).
+    fn allocate_burst_redis_db() -> u32 {
+        let span = BURST_REDIS_DB_MAX - BURST_REDIS_DB_MIN + 1;
+        let n = NEXT_BURST_REDIS_DB.fetch_add(1, Ordering::Relaxed);
+        BURST_REDIS_DB_MIN + (n % span)
+    }
+
+    /// Rewrite `url` so the logical Redis DB is exactly `db` (nonzero).
+    fn redis_url_with_logical_db(url: &str, db: u32) -> String {
+        assert_ne!(db, 0, "burst redis DB must be nonzero");
+        let url = url.trim().trim_end_matches('/');
+        if let Some(idx) = url.rfind('/') {
+            let after = &url[idx + 1..];
+            if !after.is_empty() && after.chars().all(|c| c.is_ascii_digit()) {
+                return format!("{}{db}", &url[..=idx]);
+            }
+        }
+        format!("{url}/{db}")
+    }
+
+    fn burst_redis_url_for_db(db: u32) -> String {
+        assert_ne!(db, 0, "burst redis DB must be nonzero");
         if let Ok(url) = std::env::var("BUZZ_TEST_BURST_REDIS_URL") {
             let trimmed = url.trim();
             if !trimmed.is_empty() {
-                return trimmed.to_string();
+                // Always stamp a unique nonzero DB onto the override so parallel
+                // fixtures never share one logical database (Gate3 cycle-2 race).
+                return redis_url_with_logical_db(trimmed, db);
             }
         }
-        format!("redis://127.0.0.1:6379/{BURST_REDIS_DB}")
+        format!("redis://127.0.0.1:6379/{db}")
+    }
+
+    /// Default helper for controls that do not yet hold a fixture URL.
+    fn burst_redis_url() -> String {
+        burst_redis_url_for_db(allocate_burst_redis_db())
     }
 
     /// Reset admission/rate-limit state on the burst fixture's Redis DB.
@@ -989,12 +1044,20 @@ pub(crate) mod tests {
     ///
     /// Returns `None` with an explicit reason when the isolated dependencies are
     /// unavailable, so the burst never silently degrades into a vacuous pass.
-    async fn burst_state() -> Option<(Arc<crate::state::AppState>, buzz_core::tenant::CommunityId)>
-    {
+    ///
+    /// The returned [`BurstRedisFixtureLease`] must be kept alive for the whole
+    /// test body so a peer fixture cannot FLUSHDB the same logical DB mid-burst.
+    async fn burst_state() -> Option<(
+        BurstRedisFixtureLease,
+        Arc<crate::state::AppState>,
+        buzz_core::tenant::CommunityId,
+    )> {
+        let lease = acquire_burst_redis_fixture_lease();
         let mut config = crate::config::Config::from_env().expect("default config loads");
         config.require_relay_membership = false;
         config.database_url = burst_database_url();
-        config.redis_url = burst_redis_url();
+        let burst_db = allocate_burst_redis_db();
+        config.redis_url = burst_redis_url_for_db(burst_db);
         // Exactly what deploy/host/pepper/buzz-relay.service ships.
         config.db_pool_size = 50;
         config.max_concurrent_handlers = crate::config::handler_capacity_for_pool(50);
@@ -1033,7 +1096,7 @@ pub(crate) mod tests {
         {
             Ok(p) => p,
             Err(err) => {
-                eprintln!("burst skip: redis pool create failed (db={BURST_REDIS_DB}): {err}");
+                eprintln!("burst skip: redis pool create failed (db={burst_db}): {err}");
                 return None;
             }
         };
@@ -1044,19 +1107,19 @@ pub(crate) mod tests {
                     .await
                     .is_err()
                 {
-                    eprintln!("burst skip: redis PING failed (db={BURST_REDIS_DB})");
+                    eprintln!("burst skip: redis PING failed (db={burst_db})");
                     return None;
                 }
             }
             Err(err) => {
-                eprintln!("burst skip: redis unavailable (db={BURST_REDIS_DB}): {err}");
+                eprintln!("burst skip: redis unavailable (db={burst_db}): {err}");
                 return None;
             }
         }
-        // Deterministic isolation: clear leftover admission counters from a
-        // prior burst on this logical DB before building AppState.
+        // Deterministic isolation: clear leftover admission counters on *this*
+        // fixture's unique logical DB before building AppState.
         if let Err(err) = reset_burst_redis_admission_state(&redis_pool, &config.redis_url).await {
-            eprintln!("burst skip: redis admission reset failed: {err}");
+            eprintln!("burst skip: redis admission reset failed (db={burst_db}): {err}");
             return None;
         }
         let pubsub =
@@ -1087,7 +1150,7 @@ pub(crate) mod tests {
             nostr::Keys::generate(),
             media_storage,
         );
-        Some((Arc::new(state), community))
+        Some((lease, Arc::new(state), community))
     }
 
     /// Drain every frame a connection has been sent so far.
@@ -1107,7 +1170,7 @@ pub(crate) mod tests {
     /// and nothing closes with `error: database error`.
     #[tokio::test]
     async fn multi_agent_mention_burst_keeps_subscriptions_up_without_database_errors() {
-        let Some((state, community)) = burst_state().await else {
+        let Some((_lease, state, community)) = burst_state().await else {
             // A skipped burst must never read as a pass in CI. Setting
             // BUZZ_TEST_BURST_REQUIRE=1 turns an unavailable dependency into a
             // failure instead of a silent green.
@@ -1337,10 +1400,60 @@ event count below would be a race, not a measurement"
         ));
     }
 
+    #[test]
+    fn burst_redis_url_override_stamps_unique_nonzero_db() {
+        let a = redis_url_with_logical_db("redis://127.0.0.1:16379/14", 3);
+        let b = redis_url_with_logical_db("redis://127.0.0.1:16379", 7);
+        assert_eq!(a, "redis://127.0.0.1:16379/3");
+        assert_eq!(b, "redis://127.0.0.1:16379/7");
+        assert!(burst_redis_url_is_safe_to_flush(&a));
+        assert!(burst_redis_url_is_safe_to_flush(&b));
+    }
+
+    #[test]
+    fn burst_redis_db_allocator_never_returns_zero_and_varies() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..16 {
+            let db = allocate_burst_redis_db();
+            assert_ne!(db, 0);
+            assert!((BURST_REDIS_DB_MIN..=BURST_REDIS_DB_MAX).contains(&db));
+            seen.insert(db);
+        }
+        // Across a full cycle we must observe more than one DB — otherwise the
+        // parallel-suite race (shared fixed DB + FLUSHDB) is back.
+        assert!(
+            seen.len() > 1,
+            "allocator must rotate nonzero DBs; got {seen:?}"
+        );
+    }
+
+    /// Marker-verified RED-on-parent shape: the failed candidate pinned a single
+    /// shared logical DB (14). Remediations must not reintroduce a fixed shared
+    /// constant used by every fixture.
+    #[test]
+    fn burst_redis_isolation_no_longer_pins_shared_fixed_db_constant() {
+        let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/connection.rs"));
+        // Split the needle so this assert body does not match itself via include_str!.
+        let banned = format!("const BURST_REDIS_DB: u32 = {}", 14);
+        assert!(
+            !src.contains(&banned),
+            "shared fixed burst Redis DB constant must stay removed (Gate3 parallel race)"
+        );
+        assert!(
+            src.contains("allocate_burst_redis_db"),
+            "unique nonzero DB allocator must remain"
+        );
+        assert!(
+            src.contains("BURST_REDIS_FIXTURE_LOCK"),
+            "fixture lease lock must remain to cover DB wraparound under parallel suites"
+        );
+    }
+
     /// Gate3 continuation: planted admission counters on the burst DB must be
     /// wiped by the fixture reset (logical DB only — never FLUSHALL / DB 0).
     #[tokio::test]
     async fn burst_redis_reset_clears_planted_admission_key() {
+        let _lease = acquire_burst_redis_fixture_lease();
         let url = burst_redis_url();
         if !burst_redis_url_is_safe_to_flush(&url) {
             assert!(
@@ -1410,7 +1523,7 @@ event count below would be a race, not a measurement"
     /// to accept writes on the next run (full-suite ordering regression).
     #[tokio::test]
     async fn multi_agent_mention_burst_remains_non_vacuous_when_run_twice() {
-        let Some((state, community)) = burst_state().await else {
+        let Some((_lease, state, community)) = burst_state().await else {
             assert!(
                 std::env::var("BUZZ_TEST_BURST_REQUIRE").as_deref() != Ok("1"),
                 "BUZZ_TEST_BURST_REQUIRE=1 but the burst dependencies were unavailable"
@@ -1419,9 +1532,9 @@ event count below would be a race, not a measurement"
         };
 
         for round in 1..=2 {
-            // Re-reset between rounds so this test also proves the helper is
-            // idempotent when called explicitly (burst_state already resets once).
-            reset_burst_redis_admission_state(&state.redis_pool, &burst_redis_url())
+            // Re-reset between rounds on *this fixture's* Redis URL (not a freshly
+            // allocated DB — that would FLUSHDB the wrong logical database).
+            reset_burst_redis_admission_state(&state.redis_pool, &state.config.redis_url)
                 .await
                 .expect("explicit burst redis reset between rounds");
 
