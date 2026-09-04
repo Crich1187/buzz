@@ -4497,6 +4497,44 @@ fn is_auth_error(error: &acp::AcpError) -> bool {
     message.contains("Re-authenticate") || message.contains("API Error: 401")
 }
 
+/// Returns `true` when `error` is a non-retryable provider usage-quota exhaustion.
+///
+/// Quota windows do not refill between ACP retries: requeueing only burns the
+/// retry budget (up to the dead-letter max), amplifies circuit churn after
+/// timeouts, and delays a clear failure notice. Dead-letter immediately.
+///
+/// # Classification rationale
+///
+/// Observed field form (Kimi Code / Allegro weekly window):
+/// `"Authentication required: 403 You've reached your weekly (7-day) usage
+/// limit. …"`. Patterns are deliberately narrow:
+///
+/// - `"weekly (7-day) usage limit"` / `"You've reached your weekly"` —
+///   membership window exhaustion; not transient.
+/// - `"Authentication required: 403"` combined with `"usage limit"` — the
+///   Kimi ACP wrapper prefixes quota exhaustion this way; requiring both
+///   avoids treating unrelated 403s as permanent.
+///
+/// Explicitly excluded: `"Usage credits required for 1M context"` (product
+/// upsell / optional billing path) — that remains retryable so existing
+/// behavior is unchanged.
+fn is_provider_quota_exhausted(error: &acp::AcpError) -> bool {
+    let acp::AcpError::AgentError { message, .. } = error else {
+        return false;
+    };
+    if message.contains("weekly (7-day) usage limit")
+        || message.contains("You've reached your weekly")
+    {
+        return true;
+    }
+    message.contains("Authentication required: 403") && message.contains("usage limit")
+}
+
+/// Auth expiry and exhausted provider quota both fail closed without requeue.
+fn is_non_retryable_provider_error(error: &acp::AcpError) -> bool {
+    is_auth_error(error) || is_provider_quota_exhausted(error)
+}
+
 /// Spawn a task that posts a user-visible failure notice to the relay.
 ///
 /// Shared by the hard-cap immediate dead-letter path and the retries-exhausted
@@ -4639,20 +4677,31 @@ fn handle_prompt_result(
                 } else {
                     hard_timeout_fate_suffix = Some(" — requeued for retry (recently active)");
                 }
-            } else if matches!(&result.outcome, PromptOutcome::Error(e) if is_auth_error(e)) {
-                // Auth errors are non-retryable: the token won't self-repair
-                // between retries, so requeueing only wastes attempt slots and
-                // delays the visible failure. Dead-letter immediately and tell
-                // the user to re-authenticate the CLI.
+            } else if matches!(&result.outcome, PromptOutcome::Error(e) if is_non_retryable_provider_error(e))
+            {
+                // Auth expiry and exhausted provider quota are non-retryable:
+                // neither self-repairs between retries, so requeueing only
+                // wastes attempt slots, delays the visible failure, and can
+                // amplify circuit churn. Dead-letter immediately with a
+                // class-specific notice.
+                let quota = matches!(&result.outcome, PromptOutcome::Error(e) if is_provider_quota_exhausted(e));
                 tracing::warn!(
                     channel_id = %batch.channel_id,
                     events = batch.events.len(),
-                    "dead-lettering batch immediately — non-retryable auth error"
+                    quota_exhausted = quota,
+                    "dead-lettering batch immediately — non-retryable provider error"
                 );
-                let content = "⚠️ I couldn't process the last request: authentication failed. \
-                    Please re-authenticate the CLI (e.g. run `claude /login` or `codex login`) \
-                    and then re-send."
-                    .to_string();
+                let content = if quota {
+                    "⚠️ I couldn't process the last request: the model provider's usage \
+                        quota is exhausted. Please wait for the quota window to reset, or \
+                        ask an operator to restore capacity, then re-send."
+                        .to_string()
+                } else {
+                    "⚠️ I couldn't process the last request: authentication failed. \
+                        Please re-authenticate the CLI (e.g. run `claude /login` or `codex login`) \
+                        and then re-send."
+                        .to_string()
+                };
                 spawn_failure_notice(rest_client, &batch, content);
             } else if let Some(dead) = queue.requeue(batch) {
                 let reason = match &result.outcome {
@@ -10656,6 +10705,60 @@ mod error_outcome_emission_tests {
         );
     }
 
+    // ── provider quota exhaustion classification ───────────────────────────
+
+    #[test]
+    fn is_provider_quota_exhausted_matches_kimi_weekly_limit_message() {
+        let e = acp::AcpError::AgentError {
+            code: -32000,
+            message: "Authentication required: 403 You've reached your weekly (7-day) usage \
+                limit. Your quota will reset when the current 7-day window ends. To continue \
+                now, purchase extra usage or upgrade your plan: \
+                https://www.kimi.com/membership/subscription?tab=quota"
+                .to_string(),
+        };
+        assert!(
+            is_provider_quota_exhausted(&e),
+            "Kimi weekly usage-limit message must be classified as quota exhausted"
+        );
+        assert!(
+            is_non_retryable_provider_error(&e),
+            "quota exhaustion must be non-retryable"
+        );
+        assert!(
+            !is_auth_error(&e),
+            "quota exhaustion must remain distinct from auth-expiry classification"
+        );
+    }
+
+    #[test]
+    fn is_provider_quota_exhausted_rejects_usage_credits_upsell() {
+        let e = acp::AcpError::AgentError {
+            code: -32000,
+            message: "Usage credits required for 1M context — turn on usage credits".to_string(),
+        };
+        assert!(
+            !is_provider_quota_exhausted(&e),
+            "usage-credits upsell must NOT be treated as exhausted quota"
+        );
+        assert!(
+            !is_non_retryable_provider_error(&e),
+            "usage-credits upsell must remain retryable"
+        );
+    }
+
+    #[test]
+    fn is_provider_quota_exhausted_rejects_bare_403_without_usage_limit() {
+        let e = acp::AcpError::AgentError {
+            code: -32000,
+            message: "Authentication required: 403 Forbidden".to_string(),
+        };
+        assert!(
+            !is_provider_quota_exhausted(&e),
+            "bare 403 without usage-limit wording must not dead-letter as quota"
+        );
+    }
+
     // ── auth error dead-letter behavior ────────────────────────────────────
 
     /// An auth-class `PromptOutcome::Error` must dead-letter immediately
@@ -10744,6 +10847,94 @@ mod error_outcome_emission_tests {
             queue.queued_event_count(channel_id),
             0,
             "auth error must dead-letter immediately — no events should be pending"
+        );
+    }
+
+    /// Provider weekly-quota exhaustion must dead-letter immediately (no
+    /// requeue storm / circuit amplification) — same fate as auth expiry.
+    #[tokio::test]
+    async fn provider_quota_exhausted_dead_letters_immediately_without_requeueing() {
+        let keys = nostr::Keys::generate();
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "test")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let channel_id = uuid::Uuid::new_v4();
+        let batch = FlushBatch {
+            channel_id,
+            scope: scope::SessionScope::Conversation { channel_id },
+            events: vec![BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+
+        let quota_error = acp::AcpError::AgentError {
+            code: -32000,
+            message: "Authentication required: 403 You've reached your weekly (7-day) usage \
+                limit. Your quota will reset when the current 7-day window ends."
+                .to_string(),
+        };
+
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: None,
+                scope: None,
+                turn_id: "test-turn-id".to_string(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = std::collections::HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
+            turn_id: "test-turn-id".to_string(),
+            outcome: PromptOutcome::Error(quota_error),
+            batch: Some(batch),
+        };
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            result,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            queue.pending_channels(),
+            0,
+            "quota exhaustion must dead-letter immediately — batch must not be requeued"
+        );
+        assert_eq!(
+            queue.queued_event_count(channel_id),
+            0,
+            "quota exhaustion must dead-letter immediately — no events should be pending"
         );
     }
 
