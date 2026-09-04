@@ -1,0 +1,33 @@
+[Unit]
+Description=Buzz relay (immutable release)
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+# root-jk1sw Major 3: this unit is only ever valid alongside an installed
+# immutable release. Without these guards a stray daemon-reload + start would
+# ExecStart a path that may not exist, so the unit's presence on disk alone
+# would be an unsafe, half-deployed boundary. Condition* skips cleanly, Assert*
+# records a hard failure — together they make "unit installed, release absent"
+# a refusal rather than a crash loop.
+ConditionPathExists=/opt/buzz-relay/current/target/release/buzz-relay
+AssertPathExists=/opt/buzz-relay/current/deploy/host/pepper/buzz-relay-launch.sh
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/buzz-relay/current
+Environment=BUZZ_RELAY_ENV_FILE=/etc/buzz-relay/relay.env
+# Bound burst work below the database pool: this is relay-wide admission, not
+# an agent/model inference quota. 45 = 50 - 5 reserved connections, matching
+# config::handler_capacity_for_pool; the relay clamps to the same value, so
+# these two numbers can never silently disagree. Jitter avoids a reconnect
+# thundering herd on drain.
+Environment=BUZZ_DB_POOL_SIZE=50
+Environment=BUZZ_MAX_CONCURRENT_HANDLERS=45
+Environment=BUZZ_DRAIN_JITTER_MS=5000
+ExecStart=/opt/buzz-relay/current/deploy/host/pepper/buzz-relay-launch.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
