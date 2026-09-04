@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Qwen ACP launcher for Pepper's Buzz connector.
+#
+# Keep Qwen's normal model/auth settings, but limit optional MCP startup to the
+# healthy Pepper Context server. The global Qwen settings may contain Atlaso;
+# that server must not be allowed to stall ACP admission for Buzz mentions.
+set -euo pipefail
+
+exec /root/.npm-global/bin/qwen --acp --allowed-mcp-server-names pepper-context
