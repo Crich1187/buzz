@@ -918,6 +918,12 @@ pub(crate) mod tests {
 
     /// Isolated logical Redis DB for burst tests (root-kd5gc convention:
     /// never share DB 0 with the live relay or other suites).
+    ///
+    /// Gate3 continuation (root-jk1sw): a prior burst leaves fixed-window
+    /// admission counters on this DB; without a deterministic reset the next
+    /// full-suite burst can shed all writes (`writes_accepted=0`). Isolation
+    /// is `FLUSHDB` on **this logical DB only** — never DB 0 / never FLUSHALL —
+    /// and never weakens production admission controls.
     const BURST_REDIS_DB: u32 = 14;
 
     fn burst_redis_url() -> String {
@@ -928,6 +934,46 @@ pub(crate) mod tests {
             }
         }
         format!("redis://127.0.0.1:6379/{BURST_REDIS_DB}")
+    }
+
+    /// Reset admission/rate-limit state on the burst fixture's Redis DB.
+    ///
+    /// `FLUSHDB` applies only to the DB selected by the connection URL (the
+    /// burst logical DB). Callers must never point this at live DB 0.
+    ///
+    /// Safety guard: refuse to run when the resolved URL selects logical DB 0
+    /// (live/shared default), so a misconfigured override cannot wipe production
+    /// counters. Admission controls themselves are unchanged.
+    fn burst_redis_url_is_safe_to_flush(url: &str) -> bool {
+        let url = url.trim().trim_end_matches('/');
+        if let Some(idx) = url.rfind('/') {
+            let after = &url[idx + 1..];
+            if !after.is_empty() && after.chars().all(|c| c.is_ascii_digit()) {
+                return after.parse::<u32>().ok().is_some_and(|db| db != 0);
+            }
+        }
+        // No explicit DB segment → Redis defaults to DB 0 — refuse.
+        false
+    }
+
+    async fn reset_burst_redis_admission_state(
+        pool: &deadpool_redis::Pool,
+        redis_url: &str,
+    ) -> Result<(), String> {
+        if !burst_redis_url_is_safe_to_flush(redis_url) {
+            return Err(
+                "refusing FLUSHDB: burst redis URL must select a non-zero logical DB".to_string(),
+            );
+        }
+        let mut conn = pool
+            .get()
+            .await
+            .map_err(|err| format!("redis get for burst FLUSHDB failed: {err}"))?;
+        let _: String = redis::cmd("FLUSHDB")
+            .query_async(&mut *conn)
+            .await
+            .map_err(|err| format!("FLUSHDB on burst redis db failed: {err}"))?;
+        Ok(())
     }
 
     fn burst_database_url() -> String {
@@ -1006,6 +1052,12 @@ pub(crate) mod tests {
                 eprintln!("burst skip: redis unavailable (db={BURST_REDIS_DB}): {err}");
                 return None;
             }
+        }
+        // Deterministic isolation: clear leftover admission counters from a
+        // prior burst on this logical DB before building AppState.
+        if let Err(err) = reset_burst_redis_admission_state(&redis_pool, &config.redis_url).await {
+            eprintln!("burst skip: redis admission reset failed: {err}");
+            return None;
         }
         let pubsub =
             match buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone()).await {
@@ -1265,6 +1317,193 @@ event count below would be a race, not a measurement"
             "a fresh subscription must return burst events from the store; \
 {published} writes were acknowledged but none were readable back"
         );
+    }
+
+    #[test]
+    fn burst_redis_flush_guard_refuses_db_zero_and_accepts_non_zero() {
+        assert!(!burst_redis_url_is_safe_to_flush("redis://127.0.0.1:6379"));
+        assert!(!burst_redis_url_is_safe_to_flush("redis://127.0.0.1:6379/"));
+        assert!(!burst_redis_url_is_safe_to_flush(
+            "redis://127.0.0.1:6379/0"
+        ));
+        assert!(burst_redis_url_is_safe_to_flush(
+            "redis://127.0.0.1:6379/14"
+        ));
+        assert!(burst_redis_url_is_safe_to_flush(
+            "redis://:secret@127.0.0.1:6379/14"
+        ));
+        assert!(!burst_redis_url_is_safe_to_flush(
+            "redis://:secret@127.0.0.1:6379/0"
+        ));
+    }
+
+    /// Gate3 continuation: planted admission counters on the burst DB must be
+    /// wiped by the fixture reset (logical DB only — never FLUSHALL / DB 0).
+    #[tokio::test]
+    async fn burst_redis_reset_clears_planted_admission_key() {
+        let url = burst_redis_url();
+        if !burst_redis_url_is_safe_to_flush(&url) {
+            assert!(
+                std::env::var("BUZZ_TEST_BURST_REQUIRE").as_deref() != Ok("1"),
+                "BUZZ_TEST_BURST_REQUIRE=1 but burst redis URL is unsafe to flush"
+            );
+            return;
+        }
+        let pool = match deadpool_redis::Config::from_url(&url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+        {
+            Ok(p) => p,
+            Err(err) => {
+                eprintln!("burst reset skip: pool create failed: {err}");
+                assert!(std::env::var("BUZZ_TEST_BURST_REQUIRE").as_deref() != Ok("1"));
+                return;
+            }
+        };
+        let mut conn = match pool.get().await {
+            Ok(c) => c,
+            Err(err) => {
+                eprintln!("burst reset skip: redis unavailable: {err}");
+                assert!(std::env::var("BUZZ_TEST_BURST_REQUIRE").as_deref() != Ok("1"));
+                return;
+            }
+        };
+        if redis::cmd("PING")
+            .query_async::<String>(&mut *conn)
+            .await
+            .is_err()
+        {
+            eprintln!("burst reset skip: redis PING failed");
+            assert!(std::env::var("BUZZ_TEST_BURST_REQUIRE").as_deref() != Ok("1"));
+            return;
+        }
+        // Plant a counter shaped like production admission keys.
+        let poison = "buzz:jk1sw-isol:ratelimit:deadbeef:ws_events";
+        let _: () = redis::cmd("SET")
+            .arg(poison)
+            .arg(999_999i64)
+            .query_async(&mut *conn)
+            .await
+            .expect("plant admission poison key");
+        let before: Option<i64> = redis::cmd("GET")
+            .arg(poison)
+            .query_async(&mut *conn)
+            .await
+            .expect("get planted key");
+        assert_eq!(before, Some(999_999));
+
+        reset_burst_redis_admission_state(&pool, &url)
+            .await
+            .expect("FLUSHDB on burst db");
+
+        let after: Option<String> = redis::cmd("GET")
+            .arg(poison)
+            .query_async(&mut *conn)
+            .await
+            .expect("get after flush");
+        assert!(
+            after.is_none(),
+            "planted admission key must be gone after burst FLUSHDB"
+        );
+    }
+
+    /// Gate3 continuation: a successful burst must not leave the fixture unable
+    /// to accept writes on the next run (full-suite ordering regression).
+    #[tokio::test]
+    async fn multi_agent_mention_burst_remains_non_vacuous_when_run_twice() {
+        let Some((state, community)) = burst_state().await else {
+            assert!(
+                std::env::var("BUZZ_TEST_BURST_REQUIRE").as_deref() != Ok("1"),
+                "BUZZ_TEST_BURST_REQUIRE=1 but the burst dependencies were unavailable"
+            );
+            return;
+        };
+
+        for round in 1..=2 {
+            // Re-reset between rounds so this test also proves the helper is
+            // idempotent when called explicitly (burst_state already resets once).
+            reset_burst_redis_admission_state(&state.redis_pool, &burst_redis_url())
+                .await
+                .expect("explicit burst redis reset between rounds");
+
+            let mut agents = Vec::new();
+            for _ in 0..BURST_AGENTS {
+                let keys = Keys::generate();
+                let (conn, rx) = burst_conn(&keys, community);
+                agents.push((keys, conn, rx));
+            }
+            let mut opened = 0usize;
+            for (agent_idx, (_keys, conn, _rx)) in agents.iter().enumerate() {
+                for sub_idx in 0..BURST_SUBS_PER_AGENT {
+                    let sub_id = format!("repeat-r{round}-a{agent_idx}-s{sub_idx}");
+                    let raw =
+                        serde_json::json!(["REQ", sub_id, {"kinds": [1], "limit": 1}]).to_string();
+                    handle_text_message(raw, Arc::clone(conn), Arc::clone(&state)).await;
+                    opened += 1;
+                }
+            }
+            for _ in 0..200 {
+                let registered: usize = {
+                    let mut n = 0;
+                    for (_keys, conn, _rx) in &agents {
+                        n += conn.subscriptions.lock().await.len();
+                    }
+                    n
+                };
+                if registered == opened {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+
+            let mut tasks = Vec::new();
+            let mut published = 0usize;
+            for (agent_idx, (keys, conn, _rx)) in agents.iter().enumerate() {
+                for event_idx in 0..BURST_EVENTS_PER_AGENT {
+                    let target = &agents[(agent_idx + 1) % BURST_AGENTS].0;
+                    let event = EventBuilder::new(
+                        Kind::TextNote,
+                        format!("repeat burst r{round} a{agent_idx}-e{event_idx}"),
+                    )
+                    .tag(nostr::Tag::public_key(target.public_key()))
+                    .sign_with_keys(keys)
+                    .expect("sign");
+                    let raw = serde_json::json!(["EVENT", event]).to_string();
+                    let conn = Arc::clone(conn);
+                    let state = Arc::clone(&state);
+                    tasks.push(tokio::spawn(async move {
+                        handle_text_message(raw, conn, state).await;
+                    }));
+                    published += 1;
+                }
+            }
+            for task in tasks {
+                task.await.expect("dispatch");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            let mut ok_true = 0usize;
+            let mut ok_false = 0usize;
+            for (_keys, _conn, rx) in agents.iter_mut() {
+                for frame in drain_frames(rx) {
+                    if frame[0] == "OK" {
+                        if frame[2].as_bool() == Some(true) {
+                            ok_true += 1;
+                        } else {
+                            ok_false += 1;
+                        }
+                    }
+                }
+            }
+            eprintln!(
+                "repeat-burst round={round}: published={published} \
+writes_accepted={ok_true} writes_rejected={ok_false}"
+            );
+            assert!(
+                ok_true > 0,
+                "round {round}: expected at least one accepted write after isolation reset \
+(published={published}, rejected={ok_false})"
+            );
+        }
     }
 
     /// Non-vacuity control for the burst assertion.
