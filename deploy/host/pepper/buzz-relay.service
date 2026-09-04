@@ -1,0 +1,22 @@
+[Unit]
+Description=Buzz relay (immutable release)
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/buzz-relay/current
+Environment=BUZZ_RELAY_ENV_FILE=/etc/buzz-relay/relay.env
+# Bound burst work below the database pool: this is relay-wide admission, not
+# an agent/model inference quota. Jitter avoids a reconnect thundering herd.
+Environment=BUZZ_DB_POOL_SIZE=50
+Environment=BUZZ_MAX_CONCURRENT_HANDLERS=64
+Environment=BUZZ_DRAIN_JITTER_MS=5000
+ExecStart=/opt/buzz-relay/current/deploy/host/pepper/buzz-relay-launch.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

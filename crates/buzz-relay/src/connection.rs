@@ -657,6 +657,7 @@ pub(crate) mod tests {
     use std::sync::{Arc, Mutex};
 
     use buzz_auth::AuthMethod;
+    use futures_util::future::join_all;
     use nostr::{EventBuilder, Keys, Kind};
 
     /// A connection whose outbound frames a test can read back.
@@ -762,6 +763,38 @@ pub(crate) mod tests {
         let frame = read_frame(&mut rx);
         assert_eq!(frame[0], "CLOSED");
         assert_eq!(frame[1], "history-abc");
+    }
+
+    /// A reconnect burst can make several subscriptions contend for the same
+    /// shared admission gate. Every rejection must settle as admission rather
+    /// than reaching the database path and becoming `error: database error`.
+    #[tokio::test]
+    async fn concurrent_saturated_requests_close_as_admission_not_database_errors() {
+        let state = crate::state::tests::test_state().await;
+        let permits = state.handler_semaphore.available_permits();
+        let _held = Arc::clone(&state.handler_semaphore)
+            .acquire_many_owned(permits as u32)
+            .await
+            .expect("hold every handler permit");
+
+        let mut receivers = Vec::new();
+        let mut requests = Vec::new();
+        for index in 0..16 {
+            let (conn, rx) = test_conn_with_auth(AuthState::Failed);
+            let subscription_id = format!("burst-{index}");
+            receivers.push((subscription_id.clone(), rx));
+            let raw = serde_json::json!(["REQ", subscription_id, {"kinds": [1]}]).to_string();
+            requests.push(handle_text_message(raw, conn, Arc::clone(&state)));
+        }
+
+        join_all(requests).await;
+        for (subscription_id, mut rx) in receivers {
+            let frame = read_frame(&mut rx);
+            assert_eq!(frame[0], "CLOSED");
+            assert_eq!(frame[1], subscription_id);
+            assert_eq!(frame[2], "rate-limited: too many concurrent requests");
+            assert_ne!(frame[2], "error: database error");
+        }
     }
 
     /// COUNT refusals follow NIP-45 and close the named query.
