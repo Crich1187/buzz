@@ -3062,10 +3062,23 @@ mod tests {
             .permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&path, permissions).expect("chmod fake adapter");
-        let client = AcpClient::spawn(path.to_str().expect("utf8 path"), &[], &[], false)
-            .await
-            .expect("spawn named fake adapter");
-        (client, dir)
+        // ETXTBSY can race under parallel cargo test when the kernel still
+        // holds a write mapping on a freshly chmod'd script (root-e919r flake).
+        let mut last_err = None;
+        for attempt in 0..8 {
+            match AcpClient::spawn(path.to_str().expect("utf8 path"), &[], &[], false).await {
+                Ok(client) => return (client, dir),
+                Err(e) => {
+                    let busy = matches!(&e, AcpError::Io(io) if io.raw_os_error() == Some(26));
+                    last_err = Some(e);
+                    if !busy {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20 * (attempt + 1))).await;
+                }
+            }
+        }
+        panic!("spawn named fake adapter: {:?}", last_err);
     }
 
     /// Spawn a probe script whose file name carries a runtime identity (e.g.
