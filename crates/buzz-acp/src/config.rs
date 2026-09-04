@@ -825,11 +825,31 @@ fn default_agent_args(command: &str) -> Option<Vec<String>> {
     }
 }
 
+/// Resolve the agent *runtime* identity for env defaults.
+///
+/// Pepper's fleet launcher is often `/…/acp-agent <runtime>` (e.g. `kimi`).
+/// Env defaults must key off that runtime arg, not the wrapper basename —
+/// otherwise Hermes/Kimi MCP startup bounds never apply on the live path.
+pub(crate) fn agent_runtime_identity(command: &str, args: &[String]) -> String {
+    let cmd = normalize_agent_command_identity(command);
+    if cmd == "acp-agent" {
+        if let Some(runtime) = args
+            .first()
+            .map(|a| a.trim().to_ascii_lowercase())
+            .filter(|a| !a.is_empty())
+        {
+            return runtime;
+        }
+    }
+    cmd
+}
+
 /// Per-runtime environment defaults applied when Buzz owns the agent process.
 ///
-/// Mirrors [`default_agent_args`]: keyed on the normalized command identity,
-/// with the merge (in `AcpClient::spawn`) giving explicit persona env and
-/// inherited parent env precedence over these defaults.
+/// Mirrors [`default_agent_args`]: keyed on the resolved runtime identity
+/// (see [`agent_runtime_identity`]), with the merge (in `AcpClient::spawn`)
+/// giving explicit persona env and inherited parent env precedence over these
+/// defaults.
 ///
 /// Hermes: ACP hosts supply session MCP servers explicitly through
 /// `session/new`, but Hermes otherwise starts every profile-configured MCP
@@ -837,9 +857,19 @@ fn default_agent_args(command: &str) -> Option<Vec<String>> {
 /// startup budget (see block/buzz#3355). Skip that unrelated global startup
 /// by default; an operator or persona can still opt back in by setting the
 /// variable explicitly.
-pub(crate) fn default_agent_env(command: &str) -> &'static [(&'static str, &'static str)] {
-    match normalize_agent_command_identity(command).as_str() {
+///
+/// Kimi: profile MCP servers (atlaso / pepper-context / hindsight, …) can
+/// similarly stall ACP `initialize` past the harness's 60s request timeout
+/// (root-ylp2d / root-ouhe). Bound MCP startup so a hung server cannot keep
+/// the child silent through the circuit-open window. Operators can raise or
+/// clear `KIMI_MCP_STARTUP_TIMEOUT_MS` explicitly.
+pub(crate) fn default_agent_env(
+    command: &str,
+    args: &[String],
+) -> &'static [(&'static str, &'static str)] {
+    match agent_runtime_identity(command, args).as_str() {
         "hermes" | "hermes-agent" | "hermes-acp" => &[("HERMES_ACP_SKIP_CONFIGURED_MCP", "1")],
+        "kimi" | "kimi-code" => &[("KIMI_MCP_STARTUP_TIMEOUT_MS", "8000")],
         _ => &[],
     }
 }
@@ -1770,6 +1800,7 @@ mod tests {
 
     #[test]
     fn default_agent_env_recognizes_hermes_identities() {
+        let no_args: &[String] = &[];
         for command in [
             "hermes",
             "hermes-agent",
@@ -1779,17 +1810,41 @@ mod tests {
             r"C:\Users\test\AppData\Roaming\npm\hermes-acp.cmd",
         ] {
             assert_eq!(
-                default_agent_env(command),
+                default_agent_env(command, no_args),
                 &[("HERMES_ACP_SKIP_CONFIGURED_MCP", "1")],
                 "unexpected env defaults for {command}"
             );
         }
         for command in ["goose", "codex-acp", "claude-agent-acp", "buzz-agent", ""] {
             assert!(
-                default_agent_env(command).is_empty(),
+                default_agent_env(command, no_args).is_empty(),
                 "non-Hermes command must have no env defaults: {command}"
             );
         }
+    }
+
+    #[test]
+    fn default_agent_env_bounds_kimi_mcp_startup_via_wrapper_args() {
+        // Live Pepper unit: `--agent-command /root/buzz/bin/acp-agent --agent-args kimi`
+        let kimi_args = vec!["kimi".into()];
+        assert_eq!(
+            agent_runtime_identity("/root/buzz/bin/acp-agent", &kimi_args),
+            "kimi"
+        );
+        assert_eq!(
+            default_agent_env("/root/buzz/bin/acp-agent", &kimi_args),
+            &[("KIMI_MCP_STARTUP_TIMEOUT_MS", "8000")],
+            "acp-agent kimi must receive MCP startup bound (root-ylp2d hang layer)"
+        );
+        assert_eq!(
+            default_agent_env("/root/.kimi-code/bin/kimi", &[]),
+            &[("KIMI_MCP_STARTUP_TIMEOUT_MS", "8000")],
+            "direct kimi binary must also receive the bound"
+        );
+        assert!(
+            default_agent_env("/root/buzz/bin/acp-agent", &["claude".into()]).is_empty(),
+            "acp-agent claude must not inherit kimi env defaults"
+        );
     }
 
     #[test]

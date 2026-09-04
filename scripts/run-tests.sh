@@ -125,6 +125,15 @@ run_unit_tests() {
   # step with `just test-unit`; ignored lifecycle tests run elsewhere.
   run_test_step "buzz-acp unit tests" \
     cargo test -p buzz-acp --lib -- --nocapture
+
+  # root-ylp2d: real Kimi ACP initialize+turn against isolated OpenAI-compat
+  # streaming fake + controlled-transport signed marker (skips if kimi absent).
+  if [[ -x /root/.kimi-code/bin/kimi ]]; then
+    run_test_step "buzz-acp kimi ACP initialize/turn proof" \
+      bash crates/buzz-acp/tests/kimi_acp_initialize_turn.sh
+  else
+    echo "[run-tests] skip buzz-acp kimi ACP initialize/turn proof (kimi binary missing)"
+  fi
 }
 
 # ---- DB / integration tests (infra required) --------------------------------
