@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,6 +28,40 @@ use crate::state::{
 
 /// Maximum time a new socket may hold a connection slot without completing NIP-42 auth.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Single bounded extension granted to a connection whose AUTH verification is
+/// still in flight when [`AUTH_TIMEOUT`] expires.
+///
+/// root-jk1sw Gate4 Minor 1. One extension, not a loop: a client that has sent
+/// an AUTH event has proven it is a real participant and deserves to outlive a
+/// verification queue, but it must not be able to hold a connection slot
+/// indefinitely by keeping a verification pending.
+const AUTH_VERIFY_GRACE: Duration = Duration::from_secs(5);
+
+/// Decide whether an unauthenticated connection has run out of time.
+///
+/// Returns `true` when the connection should be cancelled. A connection with a
+/// verification in flight is granted exactly one [`AUTH_VERIFY_GRACE`] window;
+/// a silent socket is reaped immediately, as before.
+async fn auth_deadline_expired(conn: &Arc<ConnectionState>) -> bool {
+    if matches!(*conn.auth_state.read().await, AuthState::Authenticated(_)) {
+        return false;
+    }
+    if conn.auth_in_flight.load(Ordering::Acquire) {
+        metrics::counter!("buzz_ws_auth_verify_grace_total").increment(1);
+        tokio::time::sleep(AUTH_VERIFY_GRACE).await;
+        if matches!(*conn.auth_state.read().await, AuthState::Authenticated(_)) {
+            return false;
+        }
+    }
+    warn!(
+        conn_id = %conn.conn_id,
+        timeout_secs = AUTH_TIMEOUT.as_secs(),
+        "NIP-42 auth timeout — closing connection"
+    );
+    metrics::counter!("buzz_ws_auth_timeouts_total").increment(1);
+    true
+}
 
 /// Shared mutable subscription map for a single WebSocket connection.
 pub(crate) type ConnectionSubscriptions = Arc<Mutex<HashMap<String, Vec<Filter>>>>;
@@ -85,6 +119,17 @@ pub struct ConnectionState {
     pub backpressure_count: Arc<AtomicU8>,
     /// Configurable slow-client grace limit (from `Config::slow_client_grace_limit`).
     pub grace_limit: u8,
+    /// Set while a NIP-42 AUTH event submitted by this connection is being
+    /// verified.
+    ///
+    /// root-jk1sw Gate4 Minor 1: Schnorr verification runs on the blocking
+    /// pool, so a synchronized reconnect herd queues verifications behind each
+    /// other. Under a live 80-connection burst that queue outlasted the flat
+    /// [`AUTH_TIMEOUT`] and the relay dropped clients that had already sent a
+    /// valid AUTH. The timeout task consults this flag so a connection with
+    /// verification genuinely in flight gets one bounded extension, while a
+    /// socket that has sent nothing is still reaped on the original deadline.
+    pub auth_in_flight: Arc<AtomicBool>,
 }
 
 impl ConnectionState {
@@ -193,6 +238,7 @@ async fn handle_active_connection(
         cancel: cancel.clone(),
         backpressure_count: Arc::clone(&backpressure_count),
         grace_limit: state.config.slow_client_grace_limit,
+        auth_in_flight: Arc::new(AtomicBool::new(false)),
     });
 
     info!(conn_id = %conn_id, addr = %addr, "WebSocket connection established");
@@ -254,17 +300,7 @@ async fn handle_active_connection(
     let auth_timeout_task = tokio::spawn(async move {
         tokio::select! {
             _ = tokio::time::sleep(AUTH_TIMEOUT) => {
-                let authenticated = matches!(
-                    *auth_timeout_conn.auth_state.read().await,
-                    AuthState::Authenticated(_)
-                );
-                if !authenticated {
-                    warn!(
-                        conn_id = %auth_timeout_conn.conn_id,
-                        timeout_secs = AUTH_TIMEOUT.as_secs(),
-                        "NIP-42 auth timeout — closing connection"
-                    );
-                    metrics::counter!("buzz_ws_auth_timeouts_total").increment(1);
+                if auth_deadline_expired(&auth_timeout_conn).await {
                     auth_timeout_cancel.cancel();
                 }
             }
@@ -682,8 +718,79 @@ pub(crate) mod tests {
             cancel: CancellationToken::new(),
             backpressure_count: Arc::new(AtomicU8::new(0)),
             grace_limit: 3,
+            auth_in_flight: Arc::new(AtomicBool::new(false)),
         };
         (Arc::new(conn), send_rx)
+    }
+
+    // -------------------------------------------------------------------
+    // root-jk1sw Gate4 Minor 1 — synchronized auth-timeout admission.
+    //
+    // A live 80-connection synchronized burst dropped 10 connections with
+    // "NIP-42 auth timeout" even though those clients had sent a valid AUTH:
+    // Schnorr verification queues on the blocking pool, and the flat
+    // AUTH_TIMEOUT expired while the client waited its turn. These tests pin
+    // the grace contract, including that it stays bounded.
+    // -------------------------------------------------------------------
+
+    fn pending_state() -> AuthState {
+        AuthState::Pending {
+            challenge: "test-challenge".to_string(),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_socket_is_still_reaped_on_the_original_deadline() {
+        // No AUTH ever sent: the slot-holding protection must be unchanged.
+        let (conn, _rx) = test_conn_with_auth(pending_state());
+        assert!(
+            auth_deadline_expired(&conn).await,
+            "a connection that never attempted auth must be cancelled"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn authenticated_connection_is_never_reaped() {
+        let (conn, _rx) = test_conn_with_auth(authenticated_state());
+        assert!(!auth_deadline_expired(&conn).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn in_flight_verification_earns_a_grace_window_and_survives() {
+        // The regression: verification is queued when the deadline fires, and
+        // completes during the grace window. The connection must live.
+        let (conn, _rx) = test_conn_with_auth(pending_state());
+        conn.auth_in_flight.store(true, Ordering::Release);
+
+        let conn_for_task = Arc::clone(&conn);
+        let completer = tokio::spawn(async move {
+            // Land inside the grace window.
+            tokio::time::sleep(AUTH_VERIFY_GRACE / 2).await;
+            *conn_for_task.auth_state.write().await = authenticated_state();
+            conn_for_task.auth_in_flight.store(false, Ordering::Release);
+        });
+
+        let expired = auth_deadline_expired(&conn).await;
+        completer.await.expect("completer task");
+        assert!(
+            !expired,
+            "a connection whose AUTH verification completed within the grace \
+             window must not be cancelled"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn grace_is_bounded_and_does_not_let_a_stalled_verification_hold_a_slot() {
+        // Sabotage the fix's own risk: if the grace were unbounded (or looped),
+        // a client could pin a connection slot forever by keeping a
+        // verification pending. Exactly one window, then reaped.
+        let (conn, _rx) = test_conn_with_auth(pending_state());
+        conn.auth_in_flight.store(true, Ordering::Release);
+        assert!(
+            auth_deadline_expired(&conn).await,
+            "a verification that never completes must still lose its slot after \
+             one grace window"
+        );
     }
 
     /// An authenticated connection — the only state admission quotas apply to.
@@ -786,7 +893,14 @@ pub(crate) mod tests {
             remote_addr: "127.0.0.1:1234".parse().expect("socket addr"),
             auth_state: RwLock::new(AuthState::Authenticated(AuthContext {
                 pubkey: keys.public_key(),
-                scopes: Vec::new(),
+                // root-jk1sw Gate4: these must be the scopes the real NIP-42
+                // path grants. With an empty scope set the burst's mention
+                // EVENTs were rejected as `restricted: insufficient scope`
+                // before reaching the store, so the fixture was measuring
+                // subscription survival under *rejected* writes — not under a
+                // mention burst. `Scope::all_known()` is exactly what
+                // `AuthService::verify_auth_event` returns.
+                scopes: buzz_auth::Scope::all_known(),
                 channel_ids: None,
                 auth_method: AuthMethod::Nip42,
                 agent_owner_pubkey: None,
@@ -797,6 +911,7 @@ pub(crate) mod tests {
             cancel: CancellationToken::new(),
             backpressure_count: Arc::new(AtomicU8::new(0)),
             grace_limit: 3,
+            auth_in_flight: Arc::new(AtomicBool::new(false)),
         };
         (Arc::new(conn), send_rx)
     }
@@ -1027,9 +1142,25 @@ pub(crate) mod tests {
         let mut frames_seen = 0usize;
         let mut database_error_closes = Vec::new();
         let mut closed_sub_ids = Vec::new();
+        // root-jk1sw Gate4: write-path verification.
+        //
+        // The burst previously proved only that subscriptions survived. It
+        // never checked that the mention EVENTs it published were actually
+        // accepted, so a relay that silently rejected every write would still
+        // have passed. Gate 4 could not close that gap live (publishing to the
+        // production relay was out of scope), so the fixture must.
+        let mut ok_true = 0usize;
+        let mut ok_false: Vec<String> = Vec::new();
         for (_keys, _conn, rx) in agents.iter_mut() {
             for frame in drain_frames(rx) {
                 frames_seen += 1;
+                if frame[0] == "OK" {
+                    if frame[2].as_bool() == Some(true) {
+                        ok_true += 1;
+                    } else {
+                        ok_false.push(frame[3].as_str().unwrap_or_default().to_string());
+                    }
+                }
                 if frame[0] == "CLOSED" {
                     let sub_id = frame[1].as_str().unwrap_or_default().to_string();
                     let reason = frame[2].as_str().unwrap_or_default().to_string();
@@ -1049,9 +1180,34 @@ pub(crate) mod tests {
         eprintln!(
             "burst denominators: agents={BURST_AGENTS} subscriptions_opened={opened} \
 events_published={published} frames_observed={frames_seen} \
-subscriptions_still_open={still_open} closed_frames={} database_error_closes={}",
+subscriptions_still_open={still_open} closed_frames={} database_error_closes={} \
+writes_accepted={ok_true} writes_rejected={}",
             closed_sub_ids.len(),
-            database_error_closes.len()
+            database_error_closes.len(),
+            ok_false.len()
+        );
+
+        // Write path. Under a deliberate burst some writes are legitimately
+        // shed by admission (`rate-limited: …`) — that is the behaviour this
+        // bead exists to produce. What must never appear is a write rejected
+        // because the database could not serve it, or rejected for a reason
+        // that means the burst was not really exercising the write path
+        // (an authorization refusal, say, which is how this fixture silently
+        // published nothing before root-jk1sw Gate4).
+        let non_admission_rejections: Vec<&String> = ok_false
+            .iter()
+            .filter(|reason| !reason.starts_with("rate-limited:"))
+            .collect();
+        assert!(
+            non_admission_rejections.is_empty(),
+            "burst writes were rejected for non-admission reasons \
+({} of {published}): {non_admission_rejections:?}",
+            non_admission_rejections.len()
+        );
+        assert!(
+            ok_true > 0,
+            "denominator: not one of the {published} published mention events \
+was accepted — the burst proves nothing about the write path"
         );
 
         assert!(
@@ -1066,6 +1222,48 @@ subscriptions_still_open={still_open} closed_frames={} database_error_closes={}"
             still_open, opened,
             "all {opened} subscriptions must stay up through the burst; \
 closed frames were: {closed_sub_ids:?}"
+        );
+
+        // Read-after-write: an OK acknowledgement is the relay's claim; this
+        // is the proof. A fresh subscription must return burst events from the
+        // store, so "accepted" cannot mean "acknowledged and dropped".
+        let (_verify_keys, verify_conn, mut verify_rx) = {
+            let keys = Keys::generate();
+            let (conn, rx) = burst_conn(&keys, community);
+            (keys, conn, rx)
+        };
+        let raw =
+            serde_json::json!(["REQ", "burst-readback", {"kinds": [1], "limit": 100}]).to_string();
+        handle_text_message(raw, Arc::clone(&verify_conn), Arc::clone(&state)).await;
+
+        let mut readback_events = 0usize;
+        let mut readback_eose = false;
+        for _ in 0..200 {
+            for frame in drain_frames(&mut verify_rx) {
+                match frame[0].as_str() {
+                    Some("EVENT") => readback_events += 1,
+                    Some("EOSE") => readback_eose = true,
+                    _ => {}
+                }
+            }
+            if readback_eose && readback_events > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        eprintln!(
+            "burst read-back: events_returned={readback_events} eose={readback_eose} \
+(of {published} published)"
+        );
+        assert!(
+            readback_eose,
+            "the read-back subscription must complete (EOSE) — without it the \
+event count below would be a race, not a measurement"
+        );
+        assert!(
+            readback_events > 0,
+            "a fresh subscription must return burst events from the store; \
+{published} writes were acknowledged but none were readable back"
         );
     }
 

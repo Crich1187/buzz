@@ -34,7 +34,7 @@ pub mod scope;
 
 pub use access::{check_read_access, check_write_access, require_scope, ChannelAccessChecker};
 pub use error::AuthError;
-pub use nip42::{generate_challenge, verify_nip42_event};
+pub use nip42::{generate_challenge, verify_nip42_event, verify_nip42_event_against};
 pub use nip98::verify_nip98_event;
 pub use nip98_replay::{
     nip98_replay_key, nip98_replay_key_for_scope, Nip98ReplayGuard, DEFAULT_REPLAY_TTL_SECS,
@@ -134,12 +134,31 @@ impl AuthService {
         expected_challenge: &str,
         relay_url: &str,
     ) -> Result<AuthContext, AuthError> {
+        self.verify_auth_event_against(auth_event, expected_challenge, &[relay_url.to_string()])
+            .await
+    }
+
+    /// Verify a NIP-42 AUTH event against a bounded set of accepted relay URLs.
+    ///
+    /// See [`verify_nip42_event_against`] for why an accepted set does not
+    /// weaken the relay binding. Callers build the set from the connection's
+    /// resolved host so every entry names the same relay.
+    pub async fn verify_auth_event_against(
+        &self,
+        auth_event: nostr::Event,
+        expected_challenge: &str,
+        accepted_relay_urls: &[String],
+    ) -> Result<AuthContext, AuthError> {
         // Verify NIP-42 signature (spawn_blocking for CPU-bound Schnorr verify)
         let event_clone = auth_event.clone();
         let challenge_owned = expected_challenge.to_string();
-        let relay_owned = relay_url.to_string();
+        let accepted_owned = accepted_relay_urls.to_vec();
         tokio::task::spawn_blocking(move || {
-            verify_nip42_event(&event_clone, &challenge_owned, &relay_owned)
+            crate::nip42::verify_nip42_event_against(
+                &event_clone,
+                &challenge_owned,
+                &accepted_owned,
+            )
         })
         .await
         .map_err(|_| AuthError::Internal("spawn_blocking panicked".into()))??;

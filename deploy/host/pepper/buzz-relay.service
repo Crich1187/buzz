@@ -25,6 +25,17 @@ Environment=BUZZ_RELAY_ENV_FILE=/etc/buzz-relay/relay.env
 Environment=BUZZ_DB_POOL_SIZE=50
 Environment=BUZZ_MAX_CONCURRENT_HANDLERS=45
 Environment=BUZZ_DRAIN_JITTER_MS=5000
+# root-jk1sw Gate4 Blocker: this relay is reachable over two transports. The
+# public identity is wss://<host> through the TLS ingress; on-host clients
+# (buzz-acp-fleet@*, buzz-acp-kimi) reach the same relay as ws://<host> through
+# buzz-local-loopback, and therefore sign that scheme in their NIP-42 relay
+# tag. Without this line the relay accepts only its canonical scheme and every
+# on-host client fails authentication and reconnect-loops.
+#
+# This is a scheme list, not a URL list: the host is always the connection's
+# own resolved community host, so it cannot admit another relay's AUTH event.
+# Removing it does not weaken security — it re-breaks the fleet.
+Environment=BUZZ_RELAY_URL_ALIAS_SCHEMES=ws
 ExecStart=/opt/buzz-relay/current/deploy/host/pepper/buzz-relay-launch.sh
 Restart=on-failure
 RestartSec=5

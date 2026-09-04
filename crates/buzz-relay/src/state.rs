@@ -1695,6 +1695,7 @@ pub(crate) mod tests {
             cancel: cancel.clone(),
             backpressure_count: Arc::clone(&bp),
             grace_limit: 3,
+            auth_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let mgr = ConnectionManager::new();

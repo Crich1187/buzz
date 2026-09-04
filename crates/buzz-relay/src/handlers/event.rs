@@ -1410,6 +1410,7 @@ mod tests {
             cancel: CancellationToken::new(),
             backpressure_count: Arc::new(AtomicU8::new(0)),
             grace_limit: 3,
+            auth_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
 
         super::handle_agent_observer_event(

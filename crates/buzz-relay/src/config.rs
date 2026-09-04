@@ -130,6 +130,57 @@ pub const HANDLER_POOL_RESERVED_CONNECTIONS: u32 = 5;
 /// a module cycle. `handler_pool_invariant` asserts the two stay equal.
 pub const REQUEST_DB_FANOUT: usize = 4;
 
+/// URL schemes that may appear in `BUZZ_RELAY_URL_ALIAS_SCHEMES`.
+///
+/// NIP-42 relay tags are WebSocket URLs; nothing else is a transport for this
+/// relay, so anything outside this set is an operator mistake worth failing
+/// startup over rather than ignoring.
+pub const ALLOWED_RELAY_URL_ALIAS_SCHEMES: [&str; 2] = ["ws", "wss"];
+
+/// Upper bound on configured alias schemes.
+///
+/// There are only two legal schemes; the bound exists so a pathological value
+/// cannot grow the per-AUTH comparison set.
+pub const MAX_RELAY_URL_ALIAS_SCHEMES: usize = ALLOWED_RELAY_URL_ALIAS_SCHEMES.len();
+
+/// Parse and validate `BUZZ_RELAY_URL_ALIAS_SCHEMES`.
+///
+/// Accepts a comma-separated list of `ws`/`wss` (case-insensitive, whitespace
+/// tolerated). Unset, empty, or whitespace-only yields an empty list, which
+/// means "canonical identity only". Any other token is a startup error: a
+/// misspelled scheme that was silently dropped would look configured while the
+/// fleet stayed locked out, which is precisely the failure this exists to fix.
+pub fn parse_relay_url_alias_schemes(raw: Option<&str>) -> Result<Vec<String>, ConfigError> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let mut out: Vec<String> = Vec::new();
+    for token in raw.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let lowered = token.to_ascii_lowercase();
+        if !ALLOWED_RELAY_URL_ALIAS_SCHEMES.contains(&lowered.as_str()) {
+            return Err(ConfigError::InvalidValue(format!(
+                "BUZZ_RELAY_URL_ALIAS_SCHEMES contains unsupported scheme {token:?}; \
+                 only {ALLOWED_RELAY_URL_ALIAS_SCHEMES:?} are accepted"
+            )));
+        }
+        if !out.contains(&lowered) {
+            out.push(lowered);
+        }
+    }
+    if out.len() > MAX_RELAY_URL_ALIAS_SCHEMES {
+        return Err(ConfigError::InvalidValue(format!(
+            "BUZZ_RELAY_URL_ALIAS_SCHEMES lists {} schemes; at most \
+             {MAX_RELAY_URL_ALIAS_SCHEMES} are allowed",
+            out.len()
+        )));
+    }
+    Ok(out)
+}
+
 /// Largest handler concurrency that keeps admitted work inside the writer pool.
 ///
 /// Bounds *requests*, not database acquires: one admitted handler may itself
@@ -244,6 +295,19 @@ pub struct Config {
     pub db_read_pool_size: Option<u32>,
     /// Public WebSocket URL of this relay, advertised in NIP-11.
     pub relay_url: String,
+    /// Additional URL schemes this relay accepts in a NIP-42 `relay` tag, on
+    /// top of the scheme implied by [`Config::relay_url`].
+    ///
+    /// Empty by default — the relay then accepts only its canonical identity,
+    /// which is the historical behaviour. Set `BUZZ_RELAY_URL_ALIAS_SCHEMES`
+    /// when clients reach the relay over more than one transport (for example a
+    /// public `wss://` ingress plus an internal plaintext `ws://` loopback):
+    /// without it those clients sign a relay tag the relay does not recognise
+    /// and every NIP-42 handshake fails. See
+    /// [`crate::api::bridge::nip42_accepted_relay_urls`] for how the accepted
+    /// set is built — the host always stays the connection's resolved tenant
+    /// host, so this can never admit a foreign relay's AUTH event.
+    pub relay_url_alias_schemes: Vec<String>,
     /// Public WebSocket URL of the dedicated device-pairing relay, when configured.
     pub pairing_relay_url: Option<String>,
     /// Maximum number of concurrent WebSocket connections.
@@ -703,6 +767,21 @@ impl Config {
 
         let relay_url =
             std::env::var("RELAY_URL").unwrap_or_else(|_| "ws://localhost:3000".to_string());
+
+        // root-jk1sw Gate4 Blocker: transport aliases for the NIP-42 relay tag.
+        //
+        // Deliberately a scheme list and not a URL list. A URL list would let a
+        // typo or a hostile edit name a different relay and turn this into a
+        // cross-relay AUTH replay hole; a scheme is composed onto the
+        // connection's own resolved host at verification time, so the host can
+        // never be attacker- or operator-substituted here. Only `ws` and `wss`
+        // are permitted, unknown values are a startup error rather than a
+        // silently ignored entry, and the list is bounded.
+        let relay_url_alias_schemes = parse_relay_url_alias_schemes(
+            std::env::var("BUZZ_RELAY_URL_ALIAS_SCHEMES")
+                .ok()
+                .as_deref(),
+        )?;
 
         let pairing_relay_url = std::env::var("BUZZ_PAIRING_RELAY_URL")
             .ok()
@@ -1324,6 +1403,7 @@ impl Config {
             db_pool_size,
             db_read_pool_size,
             relay_url,
+            relay_url_alias_schemes,
             pairing_relay_url,
             max_connections,
             max_concurrent_handlers,
@@ -2571,6 +2651,74 @@ mod tests {
         assert!(matches!(
             parse_bind_addr("not-an-addr"),
             Err(ConfigError::InvalidBindAddr(_))
+        ));
+    }
+
+    // root-jk1sw Gate4 Blocker — alias-scheme parsing is a startup gate.
+    #[test]
+    fn relay_url_alias_schemes_default_to_canonical_only() {
+        // Unset, empty, and whitespace-only must all mean "no aliases", not
+        // "accept anything" — the fail-closed default.
+        assert!(parse_relay_url_alias_schemes(None)
+            .expect("unset")
+            .is_empty());
+        assert!(parse_relay_url_alias_schemes(Some(""))
+            .expect("empty")
+            .is_empty());
+        assert!(parse_relay_url_alias_schemes(Some("   "))
+            .expect("blank")
+            .is_empty());
+        assert!(parse_relay_url_alias_schemes(Some(",, ,"))
+            .expect("separators only")
+            .is_empty());
+    }
+
+    #[test]
+    fn relay_url_alias_schemes_parse_normalize_and_dedupe() {
+        assert_eq!(
+            parse_relay_url_alias_schemes(Some("ws")).expect("ws"),
+            vec!["ws".to_string()]
+        );
+        assert_eq!(
+            parse_relay_url_alias_schemes(Some(" WS , wss ")).expect("mixed case and spaces"),
+            vec!["ws".to_string(), "wss".to_string()]
+        );
+        assert_eq!(
+            parse_relay_url_alias_schemes(Some("ws,ws,WS")).expect("duplicates"),
+            vec!["ws".to_string()],
+            "duplicates must collapse so the accepted set stays bounded"
+        );
+    }
+
+    #[test]
+    fn relay_url_alias_schemes_reject_anything_that_is_not_a_websocket_scheme() {
+        // A silently-ignored typo would present as "configured" while the
+        // fleet stayed locked out. Every one of these must fail startup.
+        for bad in [
+            "http",
+            "https",
+            "wsss",
+            "w s",
+            "ws://buzz.example",
+            "file",
+            "*",
+            "ws;wss",
+        ] {
+            let err = parse_relay_url_alias_schemes(Some(bad));
+            assert!(
+                matches!(err, Err(ConfigError::InvalidValue(ref m))
+                    if m.contains("BUZZ_RELAY_URL_ALIAS_SCHEMES")),
+                "{bad:?} must be a startup error, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn relay_url_alias_schemes_reject_a_partially_valid_list() {
+        // One bad entry poisons the whole list rather than being dropped.
+        assert!(matches!(
+            parse_relay_url_alias_schemes(Some("ws,http")),
+            Err(ConfigError::InvalidValue(_))
         ));
     }
 

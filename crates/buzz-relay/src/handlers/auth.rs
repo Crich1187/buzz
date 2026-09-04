@@ -78,17 +78,30 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
     let auth_tag_json = extract_auth_tag_json(&event);
     let signed_auth_created_at = event.created_at.as_secs();
 
-    let relay_url =
-        crate::api::bridge::nip42_expected_relay_url(&state.config.relay_url, &conn.tenant);
+    // root-jk1sw Gate4 Blocker: accept this community's canonical identity plus
+    // any configured transport alias. Host is always the resolved tenant host.
+    let accepted_relay_urls = crate::api::bridge::nip42_accepted_relay_urls(
+        &state.config.relay_url,
+        &conn.tenant,
+        &state.config.relay_url_alias_schemes,
+    );
     let auth_svc = Arc::clone(&state.auth);
 
     metrics::counter!("buzz_auth_attempts_total", "method" => "nip42").increment(1);
 
+    // root-jk1sw Gate4 Minor 1: mark verification in flight so the auth-timeout
+    // task does not reap a client that has already sent a valid AUTH while the
+    // blocking Schnorr queue drains under a synchronized reconnect herd.
+    conn.auth_in_flight
+        .store(true, std::sync::atomic::Ordering::Release);
+    let verification = auth_svc
+        .verify_auth_event_against(event, &challenge, &accepted_relay_urls)
+        .await;
+    conn.auth_in_flight
+        .store(false, std::sync::atomic::Ordering::Release);
+
     // Pure NIP-42 verification — crypto only, no DB lookups.
-    match auth_svc
-        .verify_auth_event(event, &challenge, &relay_url)
-        .await
-    {
+    match verification {
         Ok(mut auth_ctx) => {
             let pubkey = auth_ctx.pubkey;
 

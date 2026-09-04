@@ -250,6 +250,38 @@ pub(crate) fn nip42_expected_relay_url(config_relay_url: &str, tenant: &TenantCo
     format!("{scheme}://{}", tenant.host())
 }
 
+/// Every relay URL this connection may legitimately be authenticated against.
+///
+/// The canonical identity from [`nip42_expected_relay_url`] comes first, then
+/// one entry per configured alias scheme (`Config::relay_url_alias_schemes`).
+///
+/// # Why this is safe
+///
+/// The host is **always** `tenant.host()` — the community resolved from the
+/// connection at row zero, never anything client-supplied and never anything
+/// an operator can substitute through this setting. Only the scheme varies,
+/// and only to a value validated at startup. So the cross-community replay
+/// guarantee that `nip42_expected_relay_url` exists to provide is unchanged:
+/// an AUTH event signed for community A is still rejected at community B under
+/// every scheme. What this adds is that one community reachable over both a
+/// public TLS ingress and an internal plaintext hop is treated as one relay,
+/// which is what it is.
+pub(crate) fn nip42_accepted_relay_urls(
+    config_relay_url: &str,
+    tenant: &TenantContext,
+    alias_schemes: &[String],
+) -> Vec<String> {
+    let canonical = nip42_expected_relay_url(config_relay_url, tenant);
+    let mut accepted = vec![canonical];
+    for scheme in alias_schemes {
+        let candidate = format!("{scheme}://{}", tenant.host());
+        if !accepted.contains(&candidate) {
+            accepted.push(candidate);
+        }
+    }
+    accepted
+}
+
 /// Extract a channel UUID from a single filter's `#h` tag.
 fn extract_channel_from_filter(filter: &nostr::Filter) -> Option<uuid::Uuid> {
     let h_tag = nostr::SingleLetterTag::lowercase(nostr::Alphabet::H);
@@ -3240,6 +3272,99 @@ mod postgres_tests {
             "rejection must carry RelayUrlMismatch (not a generic failure) so \
              callers can distinguish it from other auth failures; got {err:?}"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // root-jk1sw Gate4 Blocker — transport aliasing at the bridge seam.
+    //
+    // The deployed relay refused the whole fleet because it accepted only
+    // `wss://<host>` while the fleet signs `ws://<host>` over the internal
+    // loopback. These tests pin that the alias fixes exactly that and does
+    // not reopen the cross-community replay hole the tests above close.
+    // -------------------------------------------------------------------
+
+    fn verify_nip42_against_urls(
+        challenge: &str,
+        signed_relay_url: &str,
+        accepted: &[String],
+    ) -> Result<(), buzz_auth::AuthError> {
+        let keys = Keys::generate();
+        let parsed = nostr::RelayUrl::parse(signed_relay_url).expect("valid relay url");
+        let event = EventBuilder::auth(challenge, parsed)
+            .sign_with_keys(&keys)
+            .expect("sign auth event");
+        buzz_auth::nip42::verify_nip42_event_against(&event, challenge, accepted)
+    }
+
+    #[test]
+    fn accepted_relay_urls_are_canonical_only_without_configured_aliases() {
+        let tenant = fresh_tenant("buzz.example");
+        let accepted = nip42_accepted_relay_urls("wss://buzz.example", &tenant, &[]);
+        assert_eq!(accepted, vec!["wss://buzz.example".to_string()]);
+        // The regression itself: plaintext is refused when unconfigured.
+        assert!(matches!(
+            verify_nip42_against_urls("c", "ws://buzz.example", &accepted),
+            Err(buzz_auth::AuthError::RelayUrlMismatch)
+        ));
+    }
+
+    #[test]
+    fn configured_ws_alias_admits_the_internal_plaintext_transport() {
+        let tenant = fresh_tenant("buzz.example");
+        let accepted =
+            nip42_accepted_relay_urls("wss://buzz.example", &tenant, &["ws".to_string()]);
+        assert_eq!(
+            accepted,
+            vec![
+                "wss://buzz.example".to_string(),
+                "ws://buzz.example".to_string()
+            ],
+            "canonical identity must stay first and must not be displaced"
+        );
+        // Both transports now authenticate against the same community.
+        assert!(verify_nip42_against_urls("c", "ws://buzz.example", &accepted).is_ok());
+        assert!(verify_nip42_against_urls("c", "wss://buzz.example", &accepted).is_ok());
+    }
+
+    /// The sabotage that matters: aliasing must not resurrect cross-community
+    /// replay. An AUTH signed for community A stays rejected at community B
+    /// under *every* configured scheme.
+    #[test]
+    fn alias_schemes_never_admit_another_communitys_auth_event() {
+        let tenant_b = fresh_tenant("host-b.example:3100");
+        let accepted = nip42_accepted_relay_urls(
+            "wss://host-a.example:3100",
+            &tenant_b,
+            &["ws".to_string(), "wss".to_string()],
+        );
+        for url in &accepted {
+            assert!(
+                url.contains("host-b.example:3100"),
+                "every accepted URL must carry the resolved tenant host, got {url}"
+            );
+        }
+        for foreign in [
+            "ws://host-a.example:3100",
+            "wss://host-a.example:3100",
+            "ws://evil.example",
+            "wss://evil.example",
+        ] {
+            assert!(
+                matches!(
+                    verify_nip42_against_urls("c", foreign, &accepted),
+                    Err(buzz_auth::AuthError::RelayUrlMismatch)
+                ),
+                "{foreign} must never authenticate against community B"
+            );
+        }
+    }
+
+    #[test]
+    fn alias_equal_to_the_canonical_scheme_does_not_duplicate_the_entry() {
+        let tenant = fresh_tenant("buzz.example");
+        let accepted =
+            nip42_accepted_relay_urls("wss://buzz.example", &tenant, &["wss".to_string()]);
+        assert_eq!(accepted, vec!["wss://buzz.example".to_string()]);
     }
 
     /// Positive control: a NIP-42 AUTH event signed for host A MUST be

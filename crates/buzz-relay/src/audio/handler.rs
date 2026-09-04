@@ -222,10 +222,17 @@ async fn handle_active_audio_connection(
     let auth_tag_json = crate::handlers::auth::extract_auth_tag_json(&auth_msg.event);
     let signed_auth_created_at = auth_msg.event.created_at.as_secs();
 
-    let relay_url = crate::api::bridge::nip42_expected_relay_url(&state.config.relay_url, &tenant);
+    // root-jk1sw Gate4 Blocker: the huddle path shares the relay's NIP-42
+    // identity, so it must honour the same configured transport aliases —
+    // otherwise audio auth silently diverges from the websocket handshake.
+    let accepted_relay_urls = crate::api::bridge::nip42_accepted_relay_urls(
+        &state.config.relay_url,
+        &tenant,
+        &state.config.relay_url_alias_schemes,
+    );
     let auth_ctx = match state
         .auth
-        .verify_auth_event(auth_msg.event, &challenge, &relay_url)
+        .verify_auth_event_against(auth_msg.event, &challenge, &accepted_relay_urls)
         .await
     {
         Ok(ctx) => ctx,
