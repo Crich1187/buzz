@@ -40,9 +40,37 @@ non-production dry run — never to get past a failing soak.
 
 This relay is reachable two ways:
 
-- publicly as `wss://buzz.lymarinc.com` through the TLS ingress;
+- publicly as `wss://buzz.lymarinc.com` through the TLS ingress
+  (`cloudflared` → `http://127.0.0.1:3000`);
 - on-host as `ws://buzz.lymarinc.com` through `buzz-local-loopback`, which is
   how every `buzz-acp-fleet@*` and `buzz-acp-kimi` connector reaches it.
+
+### Public ingress vs Pepper `/etc/hosts` (Gate4)
+
+Pepper pins `buzz.lymarinc.com` to `127.0.0.1` in `/etc/hosts` so local ACP
+clients hit the loopback HTTP hop. That override means a naive
+`https://buzz.lymarinc.com/…` or `wss://buzz.lymarinc.com` probe **from Pepper**
+connects to `127.0.0.1:443`, where nothing listens (`curl` exit 7 / HTTP 000),
+even when Cloudflare public ingress is healthy. On-host `http://buzz.lymarinc.com`
+(port 80 → relay) and the release soak against `$health_base` remain the correct
+**local** checks; they are not a public-WSS verdict.
+
+To prove the public path from Pepper (Gate4 live-effect), run:
+
+```bash
+deploy/host/pepper/buzz-public-ingress-probe.sh
+```
+
+It resolves `A` via `1.1.1.1`, then uses `curl --resolve` + `--http1.1` so TLS
+SNI and a real WebSocket upgrade hit Cloudflare, not loopback. Expect
+`public_ingress: PASS` with HTTPS 2xx and WSS HTTP 101. Do **not** mutate
+`/etc/hosts`, `cloudflared`, or live ingress to make a naive probe pass.
+
+If that probe fails while local soak passes, the regression is ingress/tunnel
+DNS (external to the relay binary). Record exact codes; do not generic-restart
+the relay as the fix. Owner-native re-apply stays
+`deploy/host/pepper/buzz-relay-release.sh --apply … --restart` after a fresh
+cross-family Gate3 — only when the candidate itself is at fault.
 
 NIP-42 binds an AUTH event to the relay by its URL, so a client that connects
 over the plaintext hop signs `ws://…`. A relay that accepts only its canonical
@@ -144,10 +172,12 @@ Under a live burst past that ceiling the relay sheds load as
 
 ```bash
 deploy/host/pepper/tests/test-buzz-relay-release.sh
+deploy/host/pepper/tests/test-buzz-public-ingress-probe.sh
 shellcheck -x deploy/host/pepper/*.sh deploy/host/pepper/tests/*.sh
 ```
 
-The fixture covers the release pointer, rollback of release + unit + env, the
-no-op-rollback refusal, legacy-unit capture, install ordering, launcher refusal
-without a release, the logging clamp, and that rollback metadata records
-revisions without leaking env values.
+The release fixture covers the release pointer, rollback of release + unit + env,
+the no-op-rollback refusal, legacy-unit capture, install ordering, launcher
+refusal without a release, the logging clamp, and that rollback metadata records
+revisions without leaking env values. The public-ingress fixture locks the
+hosts-bypass contract and (when public DNS answers) runs the live probe.
