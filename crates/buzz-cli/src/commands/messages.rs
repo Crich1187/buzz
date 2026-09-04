@@ -5,8 +5,8 @@ use uuid::Uuid;
 use crate::client::{normalize_events, normalize_write_response, BuzzClient};
 use crate::error::CliError;
 use crate::validate::{
-    infer_language, parse_event_id, parse_uuid, read_or_stdin, truncate_diff,
-    validate_content_size, validate_hex64, validate_uuid, MAX_DIFF_BYTES,
+    infer_language, parse_event_id, parse_uuid, read_or_stdin, read_owned_0600_content_file,
+    truncate_diff, validate_content_size, validate_hex64, validate_uuid, MAX_DIFF_BYTES,
 };
 use buzz_sdk::mentions::{
     extract_at_mentions_with_known, extract_nostr_uris, strip_code_regions, MENTION_CAP,
@@ -876,6 +876,31 @@ pub async fn cmd_delete_message(
     Ok(())
 }
 
+/// Resolve edit body from `--content` / `--content-file` without putting private
+/// text on argv when the safe paths are used.
+///
+/// Precedence / conflict rules:
+/// - `--content` and `--content-file` together → usage error (mutually exclusive)
+/// - neither → usage error
+/// - `--content -` → read stdin (matches `messages send`)
+/// - `--content VALUE` → literal passthrough (compat)
+/// - `--content-file PATH` → read an owner-only mode-0600 regular file
+pub(crate) fn resolve_edit_content(
+    content: Option<&str>,
+    content_file: Option<&str>,
+) -> Result<String, CliError> {
+    match (content, content_file) {
+        (Some(_), Some(_)) => Err(CliError::Usage(
+            "--content and --content-file are mutually exclusive".into(),
+        )),
+        (None, None) => Err(CliError::Usage(
+            "provide --content VALUE, --content - (stdin), or --content-file PATH".into(),
+        )),
+        (Some(value), None) => read_or_stdin(value),
+        (None, Some(path)) => read_owned_0600_content_file(path),
+    }
+}
+
 /// Edit a message you previously sent.
 pub async fn cmd_edit_message(
     client: &BuzzClient,
@@ -993,7 +1018,14 @@ pub async fn dispatch(
             )
             .await
         }
-        MessagesCmd::Edit { event, content } => cmd_edit_message(client, &event, &content).await,
+        MessagesCmd::Edit {
+            event,
+            content,
+            content_file,
+        } => {
+            let body = resolve_edit_content(content.as_deref(), content_file.as_deref())?;
+            cmd_edit_message(client, &event, &body).await
+        }
         MessagesCmd::Delete {
             event,
             action_id,
@@ -1086,7 +1118,7 @@ mod tests {
     use super::{
         channel_id_from_event, cmd_get_thread, cmd_send_message, event_mention_pubkeys,
         find_root_from_tags, format_events, match_profiles_by_name, merge_message_mentions,
-        missing_members, normalize_explicit_mentions, parse_member_pubkeys,
+        missing_members, normalize_explicit_mentions, parse_member_pubkeys, resolve_edit_content,
         resolve_names_to_pubkeys, resolve_thread_target, thread_ref_from_event,
         thread_ref_from_parent_tags, BuzzClient, CliError, Uuid,
     };
@@ -1887,5 +1919,107 @@ mod tests {
             emoji_tags.is_empty(),
             "palette-error fallback must produce no emoji tags, got: {emoji_tags:?}"
         );
+    }
+
+    // ── messages edit argv-safe content resolution (root-67m5i) ────────────
+
+    fn edit_temp_path(label: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "buzz-edit-{}-{}-{}.body",
+            label,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        path
+    }
+
+    fn write_0600(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).unwrap();
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    #[test]
+    fn resolve_edit_content_literal_passthrough() {
+        let got = resolve_edit_content(Some("hello world"), None).unwrap();
+        assert_eq!(got, "hello world");
+    }
+
+    #[test]
+    fn resolve_edit_content_empty_literal_allowed() {
+        let got = resolve_edit_content(Some(""), None).unwrap();
+        assert_eq!(got, "");
+    }
+
+    #[test]
+    fn resolve_edit_content_multiline_from_0600_file() {
+        let path = edit_temp_path("multi");
+        let body = "alpha\nbeta\ngamma\n";
+        write_0600(&path, body);
+        let got = resolve_edit_content(None, Some(path.to_str().unwrap())).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(got, body);
+    }
+
+    #[test]
+    fn resolve_edit_content_private_marker_from_file_not_echoed_in_error_on_success() {
+        // Value-safe: assert equality by length + contains without printing body.
+        let path = edit_temp_path("priv");
+        let marker = "PRIV67M5I_MARKER_DO_NOT_ARGV";
+        let body = format!("prefix {marker} suffix");
+        write_0600(&path, &body);
+        let got = resolve_edit_content(None, Some(path.to_str().unwrap())).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(got.len(), body.len());
+        assert!(got.contains(marker));
+    }
+
+    #[test]
+    fn resolve_edit_content_rejects_both_flags() {
+        let err = resolve_edit_content(Some("x"), Some("/tmp/x")).unwrap_err();
+        match err {
+            CliError::Usage(msg) => assert!(msg.contains("mutually exclusive"), "msg={msg}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_edit_content_rejects_neither_flag() {
+        let err = resolve_edit_content(None, None).unwrap_err();
+        match err {
+            CliError::Usage(msg) => assert!(msg.contains("--content"), "msg={msg}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_edit_content_file_missing_is_usage_error() {
+        let err =
+            resolve_edit_content(None, Some("/tmp/buzz-edit-missing-67m5i-nope")).unwrap_err();
+        assert!(matches!(err, CliError::Usage(_)));
+    }
+
+    #[test]
+    fn resolve_edit_content_file_group_readable_rejected_and_cleaned() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = edit_temp_path("badmode");
+        std::fs::write(&path, "should-not-load").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&path, perms).unwrap();
+        let err = resolve_edit_content(None, Some(path.to_str().unwrap())).unwrap_err();
+        // Cleanup after failure path (caller-owned file; test removes it).
+        let removed = std::fs::remove_file(&path);
+        assert!(removed.is_ok(), "test cleanup must remove temp file");
+        match err {
+            CliError::Usage(msg) => assert!(msg.contains("0600"), "msg={msg}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
     }
 }

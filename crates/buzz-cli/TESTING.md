@@ -228,6 +228,13 @@ buzz messages search --query "CLI test" --limit 5 | jq .
 
 # messages edit
 buzz messages edit --event "$EVENT_ID" --content "Edited by CLI test" | jq .
+# messages edit from stdin / content-file — argv-safe for private bodies
+echo "Edited via stdin" | buzz messages edit --event "$EVENT_ID" --content - | jq .
+umask 077
+printf 'Edited via file' > /tmp/buzz-edit-body-$$.txt
+chmod 600 /tmp/buzz-edit-body-$$.txt
+buzz messages edit --event "$EVENT_ID" --content-file /tmp/buzz-edit-body-$$.txt | jq .
+rm -f /tmp/buzz-edit-body-$$.txt
 
 # messages delete
 buzz messages delete --event "$REPLY_ID" | jq .

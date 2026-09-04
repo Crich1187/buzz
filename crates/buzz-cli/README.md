@@ -38,6 +38,8 @@ buzz messages thread --link 'buzz://message?channel=<uuid>&id=<event-id>&thread=
 buzz messages search --query "architecture"
 buzz messages search --author <pubkey|npub|name> --since <unix-ts>
 buzz messages edit --event <event-id> --content "Updated text"
+buzz messages edit --event <event-id> --content - < updated.md   # argv-safe stdin
+buzz messages edit --event <event-id> --content-file /path/to/0600.body  # argv-safe file
 buzz messages delete --event <event-id>
 
 # Diffs

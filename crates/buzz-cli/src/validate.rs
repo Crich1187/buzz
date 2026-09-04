@@ -197,6 +197,55 @@ pub fn read_file_or_stdin(value: &str) -> Result<String, CliError> {
     }
 }
 
+/// Effective UID for ownership checks (Linux `/proc/self/status`).
+fn effective_uid() -> Option<u32> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        let Some(rest) = line.strip_prefix("Uid:") else {
+            continue;
+        };
+        // Uid: real effective saved fs
+        return rest.split_whitespace().nth(1)?.parse().ok();
+    }
+    None
+}
+
+/// Read message body from an owner-only regular file (mode bits must exclude
+/// group/other — typically `0600`). Rejects symlinks and foreign ownership so
+/// agents can pass private text via path without placing it on argv.
+pub fn read_owned_0600_content_file(path: &str) -> Result<String, CliError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|e| CliError::Usage(format!("failed to stat {path:?}: {e}")))?;
+    if meta.file_type().is_symlink() {
+        return Err(CliError::Usage(format!(
+            "content file {path:?} must be a regular file (symlinks rejected)"
+        )));
+    }
+    if !meta.is_file() {
+        return Err(CliError::Usage(format!(
+            "content file {path:?} must be a regular file"
+        )));
+    }
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(CliError::Usage(format!(
+            "content file {path:?} must be mode 0600 (no group/other access); found mode {mode:04o}"
+        )));
+    }
+    let euid = effective_uid().ok_or_else(|| {
+        CliError::Other("unable to determine effective uid for content-file ownership check".into())
+    })?;
+    if meta.uid() != euid {
+        return Err(CliError::Usage(format!(
+            "content file {path:?} must be owned by the current user"
+        )));
+    }
+    std::fs::read_to_string(path)
+        .map_err(|e| CliError::Usage(format!("failed to read {path:?}: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,5 +551,78 @@ mod tests {
         // verbatim as if it were the patch content.
         let err = super::read_file_or_stdin("0001-does-not-exist.patch").unwrap_err();
         assert!(matches!(err, CliError::Usage(_)));
+    }
+
+    // --- read_owned_0600_content_file ---
+
+    fn temp_path(label: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "buzz-cli-0600-{}-{}-{}.body",
+            label,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        path
+    }
+
+    #[test]
+    fn read_owned_0600_content_file_reads_multiline_body() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_path("ok");
+        let body = "line1\nline2\nprivate-ish\n";
+        std::fs::write(&path, body).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&path, perms).unwrap();
+        let got = super::read_owned_0600_content_file(path.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(got, body);
+    }
+
+    #[test]
+    fn read_owned_0600_content_file_rejects_group_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_path("group");
+        std::fs::write(&path, "x").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o640);
+        std::fs::set_permissions(&path, perms).unwrap();
+        let err = super::read_owned_0600_content_file(path.to_str().unwrap()).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        match err {
+            CliError::Usage(msg) => assert!(msg.contains("0600"), "msg={msg}"),
+            other => panic!("expected Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_owned_0600_content_file_rejects_missing_path() {
+        let err = super::read_owned_0600_content_file("/tmp/buzz-cli-no-such-content-file-67m5i")
+            .unwrap_err();
+        assert!(matches!(err, CliError::Usage(_)));
+    }
+
+    #[test]
+    fn read_owned_0600_content_file_rejects_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let target = temp_path("symlink-target");
+        let link = temp_path("symlink");
+        std::fs::write(&target, "secret-body").unwrap();
+        let mut perms = std::fs::metadata(&target).unwrap().permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&target, perms).unwrap();
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = super::read_owned_0600_content_file(link.to_str().unwrap()).unwrap_err();
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_file(&target);
+        match err {
+            CliError::Usage(msg) => assert!(msg.contains("symlink") || msg.contains("regular")),
+            other => panic!("expected Usage, got {other:?}"),
+        }
     }
 }

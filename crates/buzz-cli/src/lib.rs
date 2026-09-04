@@ -439,13 +439,20 @@ pub enum MessagesCmd {
         reply_to: Option<String>,
     },
     /// Edit a previously sent message
+    #[command(
+        after_help = "Examples:\n  buzz messages edit --event <HEX> --content \"updated\"\n  echo \"updated\" | buzz messages edit --event <HEX> --content -\n  buzz messages edit --event <HEX> --content-file /path/to/0600.body\n\nPrefer `--content -` (stdin) or `--content-file` (owner-only 0600 file) when the body is private — those paths keep the text out of process argv."
+    )]
     Edit {
         /// Event ID of the message to edit (64-char hex)
         #[arg(long)]
         event: String,
-        /// New message content
+        /// New message content. Use '-' to read from stdin (argv-safe).
         #[arg(long)]
-        content: String,
+        content: Option<String>,
+        /// Read new content from this owner-only mode-0600 file (argv-safe).
+        /// Mutually exclusive with `--content`.
+        #[arg(long)]
+        content_file: Option<String>,
     },
     /// Delete a message by event ID
     Delete {
