@@ -131,9 +131,10 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
         let tenant = crate::tenant::bind_community(&state.db, raw_host)
             .await
             .map_err(|_| (StatusCode::NOT_FOUND, "repository not found").into_response())?;
-        let expected_url = git_expected_url(
+        let accepted_urls = git_accepted_urls(
             &state.config.relay_url,
             &tenant,
+            &state.config.relay_url_alias_schemes,
             parts
                 .uri
                 .path_and_query()
@@ -185,8 +186,7 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
         // body=None: can't buffer streaming pack data to verify payload hash.
         // Token is time-bounded (±60s) and URL-locked — acceptable trade-off.
         let pubkey =
-            buzz_auth::nip98::verify_nip98_event(&event_json, &expected_url, &event_method, None)
-                .map_err(|e| {
+            verify_git_nip98_against(&event_json, &accepted_urls, &event_method).map_err(|e| {
                 warn!(error = %e, "git NIP-98 auth failed");
                 (StatusCode::UNAUTHORIZED, "NIP-98 auth failed").into_response()
             })?;
@@ -324,31 +324,84 @@ fn enforce_git_ban_cascade(
     }
 }
 
-/// Construct the repo-root NIP-98 `u` URL expected for a git HTTP request.
+/// Repo-root path a git HTTP request's NIP-98 `u` tag is scoped to, or `None`
+/// when `path_and_query` is not a recognised git smart-HTTP endpoint.
 ///
-/// The host is always the server-resolved tenant host. `config_relay_url` only
-/// contributes the deployment scheme (`wss://` => `https://`, otherwise
-/// `http://`) so a request to community B cannot authenticate with a token
-/// signed for community A's URL just because the deployment has one global
-/// `relay_url`.
-fn git_expected_url(
+/// The credential helper signs the repo root (`/git/{owner}/{repo}`), never
+/// the service endpoint or its query, so every recognised endpoint under one
+/// repo collapses to the same path.
+fn git_repo_root_path(path_and_query: &str) -> Option<&str> {
+    if let Some((prefix, _query)) = path_and_query.split_once("/info/refs") {
+        Some(prefix)
+    } else if let Some(prefix) = path_and_query.strip_suffix("/git-upload-pack") {
+        Some(prefix)
+    } else {
+        path_and_query.strip_suffix("/git-receive-pack")
+    }
+}
+
+/// Every repo-root NIP-98 `u` URL a git HTTP request may legitimately be
+/// authenticated against, or `None` for an unrecognised git endpoint.
+///
+/// Git-over-HTTP sibling of [`crate::api::bridge::nip98_accepted_urls`], which
+/// does the actual work once the repo-root path is known: the canonical URL
+/// (deployment scheme from `config_relay_url`, `wss://` => `https://` otherwise
+/// `http://`) comes first, then one entry per configured alias scheme
+/// (`Config::relay_url_alias_schemes`, `ws` => `http`, `wss` => `https`),
+/// deduplicated.
+///
+/// # Why this is safe
+///
+/// The host is **always** the server-resolved tenant host — bound from the
+/// request `Host` header through the authoritative communities table, never
+/// anything client-supplied and never anything an operator can substitute
+/// through this setting. Only the scheme varies, and only to a value validated
+/// at startup. So a token signed for community A's repo URL is still rejected
+/// at community B under every scheme; what this adds is that one community
+/// reachable over both a public TLS ingress and an internal plaintext hop is
+/// treated as one relay for git auth, exactly as the HTTP bridge and NIP-42
+/// already treat it.
+fn git_accepted_urls(
     config_relay_url: &str,
     tenant: &TenantContext,
+    alias_schemes: &[String],
     path_and_query: &str,
-) -> Option<String> {
-    let scheme = if config_relay_url.trim_start().starts_with("wss://") {
-        "https"
-    } else {
-        "http"
-    };
-    let repo_path = if let Some((prefix, _query)) = path_and_query.split_once("/info/refs") {
-        prefix
-    } else if let Some(prefix) = path_and_query.strip_suffix("/git-upload-pack") {
-        prefix
-    } else {
-        path_and_query.strip_suffix("/git-receive-pack")?
-    };
-    Some(format!("{scheme}://{}{repo_path}", tenant.host()))
+) -> Option<Vec<String>> {
+    let repo_path = git_repo_root_path(path_and_query)?;
+    Some(crate::api::bridge::nip98_accepted_urls(
+        config_relay_url,
+        tenant,
+        alias_schemes,
+        repo_path,
+    ))
+}
+
+/// Verify a git NIP-98 token against every accepted repo-root URL, in order.
+///
+/// The first matching candidate wins. When none match, the canonical (first)
+/// candidate's error is returned so logs read exactly as they did under
+/// single-URL verification; an empty candidate set fails closed. `body` is
+/// always `None` here: streaming pack data cannot be buffered for a payload
+/// hash (see the call site for the trade-off).
+fn verify_git_nip98_against<S: AsRef<str>>(
+    event_json: &str,
+    accepted_urls: &[S],
+    method: &str,
+) -> Result<nostr::PublicKey, buzz_auth::AuthError> {
+    let mut canonical_err: Option<buzz_auth::AuthError> = None;
+    for url in accepted_urls {
+        match buzz_auth::nip98::verify_nip98_event(event_json, url.as_ref(), method, None) {
+            Ok(pubkey) => return Ok(pubkey),
+            Err(e) => {
+                if canonical_err.is_none() {
+                    canonical_err = Some(e);
+                }
+            }
+        }
+    }
+    Err(canonical_err.unwrap_or_else(|| {
+        buzz_auth::AuthError::Nip98Invalid("no accepted request URL configured".to_string())
+    }))
 }
 
 /// Validate URL `(owner, repo)` parameters and return the canonical repo
@@ -2970,39 +3023,63 @@ mod track_c_tests {
     }
 
     #[test]
-    fn git_expected_url_uses_tenant_host_not_config_host() {
+    fn git_accepted_urls_use_tenant_host_not_config_host() {
         let tenant_a = tenant("host-a.example", 1);
         let tenant_b = tenant("host-b.example", 2);
 
-        let url_a = git_expected_url(
+        let urls_a = git_accepted_urls(
             "wss://config-host.example",
             &tenant_a,
+            &[],
             "/git/owner/repo/info/refs?service=git-upload-pack",
         )
         .expect("recognized info/refs path");
-        let url_b = git_expected_url(
+        let urls_b = git_accepted_urls(
             "wss://config-host.example",
             &tenant_b,
+            &[],
             "/git/owner/repo/info/refs?service=git-upload-pack",
         )
         .expect("recognized info/refs path");
 
-        assert_eq!(url_a, "https://host-a.example/git/owner/repo");
-        assert_eq!(url_b, "https://host-b.example/git/owner/repo");
-        assert_ne!(url_a, url_b);
+        assert_eq!(
+            urls_a,
+            vec!["https://host-a.example/git/owner/repo".to_string()]
+        );
+        assert_eq!(
+            urls_b,
+            vec!["https://host-b.example/git/owner/repo".to_string()]
+        );
+        assert_ne!(urls_a, urls_b);
 
-        let url_a_alt_config = git_expected_url(
+        let urls_a_alt_config = git_accepted_urls(
             "wss://different-config.example",
             &tenant_a,
+            &[],
             "/git/owner/repo/git-upload-pack",
         )
         .expect("recognized upload-pack path");
-        assert_eq!(url_a_alt_config, "https://host-a.example/git/owner/repo");
+        assert_eq!(
+            urls_a_alt_config,
+            vec!["https://host-a.example/git/owner/repo".to_string()]
+        );
+    }
+
+    #[test]
+    fn git_accepted_urls_reject_unrecognized_endpoints() {
+        let tenant_a = tenant("host-a.example", 1);
+        for path in ["/git/owner/repo", "/git/owner/repo/HEAD", "/events"] {
+            assert!(
+                git_accepted_urls("wss://host-a.example", &tenant_a, &["ws".to_string()], path)
+                    .is_none(),
+                "{path} must not be a recognised git endpoint even with an alias configured"
+            );
+        }
     }
 
     /// GitAuth host-bind bite: a token signed for community A's repo URL must
-    /// fail when the request Host resolved to community B. If `git_expected_url`
-    /// is changed back to `config.relay_url`'s host, the expected URL below
+    /// fail when the request Host resolved to community B. If `git_accepted_urls`
+    /// is changed back to `config.relay_url`'s host, the accepted URL below
     /// becomes A's URL and this wrongly verifies.
     #[test]
     fn git_nip98_rejects_token_signed_for_wrong_community_host() {
@@ -3010,14 +3087,15 @@ mod track_c_tests {
         let signed_for_a = "https://host-a.example/git/alice/repo";
         let event_json = git_nip98_event_json(&keys, signed_for_a, "GET");
         let tenant_b = tenant("host-b.example", 2);
-        let expected_for_b = git_expected_url(
+        let accepted_for_b = git_accepted_urls(
             "wss://host-a.example",
             &tenant_b,
+            &[],
             "/git/alice/repo/info/refs?service=git-upload-pack",
         )
         .expect("recognized info/refs path");
 
-        let err = buzz_auth::nip98::verify_nip98_event(&event_json, &expected_for_b, "GET", None)
+        let err = verify_git_nip98_against(&event_json, &accepted_for_b, "GET")
             .expect_err("cross-host git NIP-98 token must be rejected");
         assert!(
             err.to_string().contains("URL mismatch"),
@@ -3031,17 +3109,142 @@ mod track_c_tests {
         let signed_for_a = "https://host-a.example/git/alice/repo";
         let event_json = git_nip98_event_json(&keys, signed_for_a, "GET");
         let tenant_a = tenant("host-a.example", 1);
-        let expected_for_a = git_expected_url(
+        let accepted_for_a = git_accepted_urls(
             "wss://different-config.example",
             &tenant_a,
+            &[],
             "/git/alice/repo/git-upload-pack",
         )
         .expect("recognized upload-pack path");
 
-        let pubkey =
-            buzz_auth::nip98::verify_nip98_event(&event_json, &expected_for_a, "GET", None)
-                .expect("matching-host git NIP-98 token must verify");
+        let pubkey = verify_git_nip98_against(&event_json, &accepted_for_a, "GET")
+            .expect("matching-host git NIP-98 token must verify");
         assert_eq!(pubkey, keys.public_key());
+    }
+
+    // -------------------------------------------------------------------
+    // root-jk1sw — transport aliasing on the git-over-HTTP NIP-98 seam,
+    // mirroring the `api::bridge` alias tests. A ws://-configured client signs
+    // http://<host>/git/{owner}/{repo}; with the alias configured that must
+    // verify, without it the historical refusal stands, and under no scheme
+    // may a token for another community's host be admitted.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn git_accepted_urls_are_canonical_only_without_configured_aliases() {
+        let tenant_a = tenant("host-a.example", 1);
+        let accepted = git_accepted_urls(
+            "wss://host-a.example",
+            &tenant_a,
+            &[],
+            "/git/alice/repo/info/refs?service=git-upload-pack",
+        )
+        .expect("recognized info/refs path");
+        assert_eq!(
+            accepted,
+            vec!["https://host-a.example/git/alice/repo".to_string()]
+        );
+
+        // The regression itself, preserved when unconfigured.
+        let keys = Keys::generate();
+        let http_json = git_nip98_event_json(&keys, "http://host-a.example/git/alice/repo", "GET");
+        let err = verify_git_nip98_against(&http_json, &accepted, "GET")
+            .expect_err("http-signed git token must be refused without a configured alias");
+        assert!(
+            err.to_string().contains("URL mismatch"),
+            "expected URL-mismatch rejection, got {err}"
+        );
+    }
+
+    #[test]
+    fn git_configured_ws_alias_admits_token_signed_over_plaintext_transport() {
+        let tenant_a = tenant("host-a.example", 1);
+        let accepted = git_accepted_urls(
+            "wss://host-a.example",
+            &tenant_a,
+            &["ws".to_string()],
+            "/git/alice/repo/git-upload-pack",
+        )
+        .expect("recognized upload-pack path");
+        assert_eq!(
+            accepted,
+            vec![
+                "https://host-a.example/git/alice/repo".to_string(),
+                "http://host-a.example/git/alice/repo".to_string(),
+            ],
+            "canonical identity must stay first and must not be displaced"
+        );
+
+        let keys = Keys::generate();
+        let http_json = git_nip98_event_json(&keys, "http://host-a.example/git/alice/repo", "GET");
+        let pubkey = verify_git_nip98_against(&http_json, &accepted, "GET")
+            .expect("ws-alias deployment must admit an http-signed git token");
+        assert_eq!(pubkey, keys.public_key());
+
+        // The canonical TLS transport keeps working unchanged.
+        let https_json =
+            git_nip98_event_json(&keys, "https://host-a.example/git/alice/repo", "GET");
+        let pubkey = verify_git_nip98_against(&https_json, &accepted, "GET")
+            .expect("canonical https git token must still verify with an alias configured");
+        assert_eq!(pubkey, keys.public_key());
+    }
+
+    #[test]
+    fn git_alias_schemes_never_admit_another_communitys_token() {
+        let tenant_b = tenant("host-b.example", 2);
+        let accepted = git_accepted_urls(
+            "wss://host-a.example",
+            &tenant_b,
+            &["ws".to_string(), "wss".to_string()],
+            "/git/alice/repo/info/refs?service=git-receive-pack",
+        )
+        .expect("recognized info/refs path");
+        for url in &accepted {
+            assert!(
+                url.contains("host-b.example"),
+                "every accepted URL must carry the resolved tenant host, got {url}"
+            );
+        }
+
+        let keys = Keys::generate();
+        for foreign in [
+            "http://host-a.example/git/alice/repo",
+            "https://host-a.example/git/alice/repo",
+            "http://evil.example/git/alice/repo",
+            "https://evil.example/git/alice/repo",
+        ] {
+            let event_json = git_nip98_event_json(&keys, foreign, "GET");
+            let err = verify_git_nip98_against(&event_json, &accepted, "GET")
+                .expect_err("a foreign-host token must never authenticate against community B");
+            assert!(
+                err.to_string().contains("URL mismatch"),
+                "{foreign}: expected URL-mismatch rejection, got {err}"
+            );
+        }
+    }
+
+    /// The alias widens only the scheme: a token for a *different repo* under
+    /// the aliased scheme is still refused, so repo scoping is untouched.
+    #[test]
+    fn git_alias_does_not_widen_repo_scope() {
+        let tenant_a = tenant("host-a.example", 1);
+        let accepted = git_accepted_urls(
+            "wss://host-a.example",
+            &tenant_a,
+            &["ws".to_string()],
+            "/git/alice/repo/git-receive-pack",
+        )
+        .expect("recognized receive-pack path");
+
+        let keys = Keys::generate();
+        let other_repo =
+            git_nip98_event_json(&keys, "http://host-a.example/git/alice/other", "GET");
+        let err = verify_git_nip98_against(&other_repo, &accepted, "GET")
+            .expect_err("token for another repo must be refused under the alias scheme");
+        assert!(
+            err.to_string().contains("URL mismatch"),
+            "expected URL-mismatch rejection, got {err}"
+        );
     }
 
     /// Split a pkt-line stream into `(len_prefix, payload)` frames, validating
