@@ -137,7 +137,12 @@ async fn authenticate(
             )
         })?;
 
-    let expected_url = bridge::nip98_expected_url(&state.config.relay_url, &tenant, path);
+    let accepted_urls = bridge::nip98_accepted_urls(
+        &state.config.relay_url,
+        &tenant,
+        &state.config.relay_url_alias_schemes,
+        path,
+    );
     let bridge::VerifiedBridgeAuth {
         pubkey,
         event_id_bytes,
@@ -145,7 +150,7 @@ async fn authenticate(
     } = bridge::verify_bridge_auth_with_options(
         headers,
         "POST",
-        &expected_url,
+        &accepted_urls,
         Some(body),
         true,
         true,

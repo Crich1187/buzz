@@ -246,7 +246,12 @@ async fn authenticate(
             )
         })?;
 
-    let url = bridge::nip98_expected_url(&state.config.relay_url, &tenant, path);
+    let accepted_urls = bridge::nip98_accepted_urls(
+        &state.config.relay_url,
+        &tenant,
+        &state.config.relay_url_alias_schemes,
+        path,
+    );
     let bridge::VerifiedBridgeAuth {
         pubkey,
         event_id_bytes,
@@ -254,7 +259,7 @@ async fn authenticate(
     } = bridge::verify_bridge_auth_with_options(
         headers,
         "POST",
-        &url,
+        &accepted_urls,
         Some(body),
         true, // invites always require NIP-98; no X-Pubkey dev fallback
         true, // POST bodies must be covered by a payload tag

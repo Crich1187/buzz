@@ -82,7 +82,10 @@ async fn authorize_operator_request(
     } = bridge::verify_bridge_auth_with_options(
         headers,
         method,
-        &url,
+        // The operator origin is an explicitly configured http(s) origin, not
+        // a transport-derived relay identity, so `relay_url_alias_schemes`
+        // does not apply: exactly one URL is accepted here.
+        std::slice::from_ref(&url),
         body,
         true, // operator endpoints always require NIP-98; no X-Pubkey dev fallback
         body.is_some(),

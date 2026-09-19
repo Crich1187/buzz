@@ -67,23 +67,37 @@ type BridgeAuthResult = Result<VerifiedBridgeAuth, (StatusCode, Json<Value>)>;
 
 /// Verify bridge auth: NIP-98 (production) or X-Pubkey (dev mode).
 ///
+/// `accepted_urls` is every request URL the NIP-98 `u` tag may legitimately
+/// carry for this request — the canonical identity first, then any configured
+/// transport aliases (see [`nip98_accepted_urls`]). Candidates are tried in
+/// order and the first match wins; when none match, the canonical candidate's
+/// error is returned so the response shape is unchanged from single-URL
+/// verification.
+///
 /// Returns the authenticated public key, an event ID for replay detection, and
 /// the verified signed auth timestamp. For X-Pubkey dev mode, the event ID is
 /// a zero hash and the timestamp is absent.
-pub(crate) fn verify_bridge_auth(
+pub(crate) fn verify_bridge_auth<S: AsRef<str>>(
     headers: &HeaderMap,
     method: &str,
-    url: &str,
+    accepted_urls: &[S],
     body: Option<&[u8]>,
     require_auth_token: bool,
 ) -> BridgeAuthResult {
-    verify_bridge_auth_with_options(headers, method, url, body, require_auth_token, false)
+    verify_bridge_auth_with_options(
+        headers,
+        method,
+        accepted_urls,
+        body,
+        require_auth_token,
+        false,
+    )
 }
 
-pub(crate) fn verify_bridge_auth_with_options(
+pub(crate) fn verify_bridge_auth_with_options<S: AsRef<str>>(
     headers: &HeaderMap,
     method: &str,
-    url: &str,
+    accepted_urls: &[S],
     body: Option<&[u8]>,
     require_auth_token: bool,
     require_payload: bool,
@@ -119,8 +133,37 @@ pub(crate) fn verify_bridge_auth_with_options(
             ));
         }
 
-        let pubkey = buzz_auth::verify_nip98_event(&event_json, url, method, body)
-            .map_err(|e| api_error(StatusCode::UNAUTHORIZED, &format!("NIP-98: {e}")))?;
+        // Try each accepted request URL in order — canonical identity first,
+        // then configured transport aliases. First match wins. If none match,
+        // surface the canonical candidate's error so the 401 body is identical
+        // to what single-URL verification produced.
+        let mut canonical_err: Option<buzz_auth::AuthError> = None;
+        let mut verified: Option<nostr::PublicKey> = None;
+        for url in accepted_urls {
+            match buzz_auth::verify_nip98_event(&event_json, url.as_ref(), method, body) {
+                Ok(pubkey) => {
+                    verified = Some(pubkey);
+                    break;
+                }
+                Err(e) => {
+                    if canonical_err.is_none() {
+                        canonical_err = Some(e);
+                    }
+                }
+            }
+        }
+        let pubkey = match verified {
+            Some(pubkey) => pubkey,
+            None => {
+                // An empty candidate set can match nothing: fail closed.
+                let e = canonical_err.unwrap_or_else(|| {
+                    buzz_auth::AuthError::Nip98Invalid(
+                        "no accepted request URL configured".to_string(),
+                    )
+                });
+                return Err(api_error(StatusCode::UNAUTHORIZED, &format!("NIP-98: {e}")));
+            }
+        };
 
         return Ok(VerifiedBridgeAuth {
             pubkey,
@@ -222,6 +265,52 @@ pub(crate) fn nip98_expected_url(
         "http"
     };
     format!("{scheme}://{}{path}", tenant.host())
+}
+
+/// Every request URL a NIP-98 `u` tag may legitimately carry for `path` on a
+/// request bound to `tenant`.
+///
+/// HTTP sibling of [`nip42_accepted_relay_urls`]. The canonical URL from
+/// [`nip98_expected_url`] comes first, then one entry per configured alias
+/// scheme (`Config::relay_url_alias_schemes`), mapped from the websocket
+/// transport it names to the HTTP scheme a client signs when it reaches the
+/// relay over that transport: `ws` → `http`, `wss` → `https`. Duplicates of
+/// the canonical entry are dropped.
+///
+/// # Why this is safe
+///
+/// The host is **always** `tenant.host()` — the community resolved from the
+/// request `Host` header at row zero, never anything client-supplied and never
+/// anything an operator can substitute through this setting. Only the scheme
+/// varies, and only to a value validated at startup. So the cross-community
+/// guarantee that `nip98_expected_url` exists to provide is unchanged: an event
+/// signed for community A's host is still rejected at community B under every
+/// scheme. What this adds is that one community reachable over both a public
+/// TLS ingress and an internal plaintext hop is treated as one relay for HTTP
+/// bridge auth, exactly as NIP-42 already treats it for websocket AUTH.
+pub(crate) fn nip98_accepted_urls(
+    config_relay_url: &str,
+    tenant: &TenantContext,
+    alias_schemes: &[String],
+    path: &str,
+) -> Vec<String> {
+    let canonical = nip98_expected_url(config_relay_url, tenant, path);
+    let mut accepted = vec![canonical];
+    for scheme in alias_schemes {
+        // Config validation only admits `ws`/`wss`; anything else is skipped
+        // rather than guessed at, so an unexpected value can never widen the
+        // accepted set.
+        let http_scheme = match scheme.as_str() {
+            "ws" => "http",
+            "wss" => "https",
+            _ => continue,
+        };
+        let candidate = format!("{http_scheme}://{}{path}", tenant.host());
+        if !accepted.contains(&candidate) {
+            accepted.push(candidate);
+        }
+    }
+    accepted
 }
 
 /// Construct the NIP-42 expected `relay` URL for a connection bound to `tenant`.
@@ -773,7 +862,12 @@ pub async fn submit_event(
             )
         })?;
 
-    let url = nip98_expected_url(&state.config.relay_url, &tenant, "/events");
+    let accepted_urls = nip98_accepted_urls(
+        &state.config.relay_url,
+        &tenant,
+        &state.config.relay_url_alias_schemes,
+        "/events",
+    );
     let VerifiedBridgeAuth {
         pubkey,
         event_id_bytes,
@@ -781,7 +875,7 @@ pub async fn submit_event(
     } = verify_bridge_auth(
         &headers,
         "POST",
-        &url,
+        &accepted_urls,
         Some(&body),
         state.config.require_auth_token,
     )?;
@@ -1062,7 +1156,12 @@ pub async fn query_events(
             )
         })?;
 
-    let url = nip98_expected_url(&state.config.relay_url, &tenant, "/query");
+    let accepted_urls = nip98_accepted_urls(
+        &state.config.relay_url,
+        &tenant,
+        &state.config.relay_url_alias_schemes,
+        "/query",
+    );
     let VerifiedBridgeAuth {
         pubkey,
         event_id_bytes,
@@ -1070,7 +1169,7 @@ pub async fn query_events(
     } = verify_bridge_auth(
         &headers,
         "POST",
-        &url,
+        &accepted_urls,
         Some(&body),
         state.config.require_auth_token,
     )?;
@@ -1605,7 +1704,12 @@ pub async fn count_events(
             )
         })?;
 
-    let url = nip98_expected_url(&state.config.relay_url, &tenant, "/count");
+    let accepted_urls = nip98_accepted_urls(
+        &state.config.relay_url,
+        &tenant,
+        &state.config.relay_url_alias_schemes,
+        "/count",
+    );
     let VerifiedBridgeAuth {
         pubkey,
         event_id_bytes,
@@ -1613,7 +1717,7 @@ pub async fn count_events(
     } = verify_bridge_auth(
         &headers,
         "POST",
-        &url,
+        &accepted_urls,
         Some(&body),
         state.config.require_auth_token,
     )?;
@@ -2405,12 +2509,23 @@ async fn authorize_moderation_read(
         Some(q) if !q.is_empty() => format!("{path}?{q}"),
         _ => path.to_string(),
     };
-    let url = nip98_expected_url(&state.config.relay_url, &tenant, &path_with_query);
+    let accepted_urls = nip98_accepted_urls(
+        &state.config.relay_url,
+        &tenant,
+        &state.config.relay_url_alias_schemes,
+        &path_with_query,
+    );
     let VerifiedBridgeAuth {
         pubkey,
         event_id_bytes,
         ..
-    } = verify_bridge_auth(headers, "GET", &url, None, state.config.require_auth_token)?;
+    } = verify_bridge_auth(
+        headers,
+        "GET",
+        &accepted_urls,
+        None,
+        state.config.require_auth_token,
+    )?;
     check_nip98_replay(state, &tenant, event_id_bytes).await?;
     let pubkey_bytes = pubkey.to_bytes().to_vec();
 
@@ -2965,11 +3080,17 @@ mod postgres_tests {
         let tenant_b = fresh_tenant("host-b.example");
         let expected_url = nip98_expected_url(config_relay_url, &tenant_b, "/events");
 
-        let (status, body) = verify_bridge_auth(&headers, "POST", &expected_url, Some(b""), true)
-            .expect_err(
-                "cross-host NIP-98 event MUST be rejected — row 44: `u` URL host \
+        let (status, body) = verify_bridge_auth(
+            &headers,
+            "POST",
+            std::slice::from_ref(&expected_url),
+            Some(b""),
+            true,
+        )
+        .expect_err(
+            "cross-host NIP-98 event MUST be rejected — row 44: `u` URL host \
                  must match req.community",
-            );
+        );
         assert_eq!(
             status,
             StatusCode::UNAUTHORIZED,
@@ -2996,7 +3117,7 @@ mod postgres_tests {
         let (status, body) = verify_bridge_auth_with_options(
             &headers,
             "POST",
-            signed_url,
+            &[signed_url],
             Some(br#"{"host":"created.example"}"#),
             true,
             true,
@@ -3035,8 +3156,14 @@ mod postgres_tests {
             pubkey,
             signed_created_at,
             ..
-        } = verify_bridge_auth(&headers, "POST", &expected_url, Some(b""), true)
-            .expect("matching-host NIP-98 event must verify");
+        } = verify_bridge_auth(
+            &headers,
+            "POST",
+            std::slice::from_ref(&expected_url),
+            Some(b""),
+            true,
+        )
+        .expect("matching-host NIP-98 event must verify");
         assert_eq!(
             pubkey,
             keys.public_key(),
@@ -3087,9 +3214,14 @@ mod postgres_tests {
             Some("limit=20&status=open"),
         );
 
-        let VerifiedBridgeAuth { pubkey, .. } =
-            verify_bridge_auth(&headers, "GET", &expected_url, None, true)
-                .expect("query-bearing moderation read must verify against the same query");
+        let VerifiedBridgeAuth { pubkey, .. } = verify_bridge_auth(
+            &headers,
+            "GET",
+            std::slice::from_ref(&expected_url),
+            None,
+            true,
+        )
+        .expect("query-bearing moderation read must verify against the same query");
         assert_eq!(pubkey, keys.public_key());
     }
 
@@ -3113,8 +3245,9 @@ mod postgres_tests {
             None,
         );
 
-        let (status, body) = verify_bridge_auth(&headers, "GET", &bare_url, None, true)
-            .expect_err("query-signed event MUST NOT match a bare-path expected URL");
+        let (status, body) =
+            verify_bridge_auth(&headers, "GET", std::slice::from_ref(&bare_url), None, true)
+                .expect_err("query-signed event MUST NOT match a bare-path expected URL");
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         let msg = body
             .get("error")
@@ -3144,9 +3277,14 @@ mod postgres_tests {
             Some("limit=20"),
         );
 
-        let VerifiedBridgeAuth { pubkey, .. } =
-            verify_bridge_auth(&headers, "GET", &expected_url, None, true)
-                .expect("audit query-bearing read must verify");
+        let VerifiedBridgeAuth { pubkey, .. } = verify_bridge_auth(
+            &headers,
+            "GET",
+            std::slice::from_ref(&expected_url),
+            None,
+            true,
+        )
+        .expect("audit query-bearing read must verify");
         assert_eq!(pubkey, keys.public_key());
     }
 
@@ -3169,9 +3307,14 @@ mod postgres_tests {
         );
         assert_eq!(expected_url, "https://host-a.example/moderation/restricted");
 
-        let VerifiedBridgeAuth { pubkey, .. } =
-            verify_bridge_auth(&headers, "GET", &expected_url, None, true)
-                .expect("query-less restricted read must verify against the bare path");
+        let VerifiedBridgeAuth { pubkey, .. } = verify_bridge_auth(
+            &headers,
+            "GET",
+            std::slice::from_ref(&expected_url),
+            None,
+            true,
+        )
+        .expect("query-less restricted read must verify against the bare path");
         assert_eq!(pubkey, keys.public_key());
     }
 
@@ -3365,6 +3508,164 @@ mod postgres_tests {
         let accepted =
             nip42_accepted_relay_urls("wss://buzz.example", &tenant, &["wss".to_string()]);
         assert_eq!(accepted, vec!["wss://buzz.example".to_string()]);
+    }
+
+    // -------------------------------------------------------------------
+    // root-jk1sw — the same transport alias on the NIP-98 HTTP bridge seam.
+    //
+    // 9b74cb80 taught NIP-42 (websocket AUTH) about `relay_url_alias_schemes`
+    // but the HTTP bridge kept verifying against exactly one URL, so fleet
+    // connectors configured with `ws://<host>` signed `http://<host>/query`
+    // and were refused with "URL mismatch" on every start. These tests pin
+    // that the alias now reaches the bridge and, as above, cannot admit a
+    // foreign community's event.
+    // -------------------------------------------------------------------
+
+    /// Sign a NIP-98 event for `signed_url` and verify it against `accepted`
+    /// the way the `/query` handler does (POST, body present, NIP-98 only).
+    fn verify_nip98_bridge_against(
+        keys: &Keys,
+        signed_url: &str,
+        accepted: &[String],
+    ) -> BridgeAuthResult {
+        let event_json = build_nip98_event_json(keys, signed_url, "POST");
+        let headers = nip98_auth_headers(&event_json);
+        verify_bridge_auth(&headers, "POST", accepted, Some(b"[]"), true)
+    }
+
+    fn assert_url_mismatch(result: BridgeAuthResult, context: &str) {
+        let (status, body) = result.expect_err(context);
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{context}");
+        let msg = body
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            msg.contains("URL mismatch"),
+            "{context}: rejection must be a URL mismatch; got body = {body:?}"
+        );
+    }
+
+    #[test]
+    fn nip98_accepted_urls_are_canonical_only_without_configured_aliases() {
+        let tenant = fresh_tenant("buzz.example");
+        let accepted = nip98_accepted_urls("wss://buzz.example", &tenant, &[], "/query");
+        assert_eq!(accepted, vec!["https://buzz.example/query".to_string()]);
+
+        // The regression itself, preserved when unconfigured: a plaintext
+        // signature is refused against a TLS-only identity.
+        let keys = Keys::generate();
+        assert_url_mismatch(
+            verify_nip98_bridge_against(&keys, "http://buzz.example/query", &accepted),
+            "http-signed event must be refused without a configured alias",
+        );
+        // Positive control so the refusal above is not vacuous.
+        verify_nip98_bridge_against(&keys, "https://buzz.example/query", &accepted)
+            .expect("canonical https signature must still verify");
+    }
+
+    #[test]
+    fn configured_ws_alias_admits_nip98_event_signed_over_plaintext_transport() {
+        let tenant = fresh_tenant("buzz.example");
+        let accepted =
+            nip98_accepted_urls("wss://buzz.example", &tenant, &["ws".to_string()], "/query");
+        assert_eq!(
+            accepted,
+            vec![
+                "https://buzz.example/query".to_string(),
+                "http://buzz.example/query".to_string(),
+            ],
+            "canonical identity must stay first and must not be displaced"
+        );
+
+        // The fleet's exact shape: a connector configured with ws://<host>
+        // signs http://<host>/query and must now be admitted...
+        let keys = Keys::generate();
+        let VerifiedBridgeAuth {
+            pubkey,
+            signed_created_at,
+            ..
+        } = verify_nip98_bridge_against(&keys, "http://buzz.example/query", &accepted)
+            .expect("ws-alias deployment must admit an http-signed /query event");
+        assert_eq!(pubkey, keys.public_key());
+        assert!(signed_created_at.is_some());
+
+        // ...while the canonical TLS transport keeps working unchanged.
+        verify_nip98_bridge_against(&keys, "https://buzz.example/query", &accepted)
+            .expect("canonical https signature must still verify with an alias configured");
+    }
+
+    /// The sabotage that matters: aliasing must not resurrect the cross-host
+    /// side door `nip98_expected_url` closed. An event signed for community A
+    /// stays rejected at community B under *every* configured scheme.
+    #[test]
+    fn nip98_alias_schemes_never_admit_another_communitys_event() {
+        let tenant_b = fresh_tenant("host-b.example");
+        let accepted = nip98_accepted_urls(
+            "wss://host-a.example",
+            &tenant_b,
+            &["ws".to_string(), "wss".to_string()],
+            "/query",
+        );
+        for url in &accepted {
+            assert!(
+                url.contains("host-b.example"),
+                "every accepted URL must carry the resolved tenant host, got {url}"
+            );
+        }
+        let keys = Keys::generate();
+        for foreign in [
+            "http://host-a.example/query",
+            "https://host-a.example/query",
+            "http://evil.example/query",
+            "https://evil.example/query",
+        ] {
+            assert_url_mismatch(
+                verify_nip98_bridge_against(&keys, foreign, &accepted),
+                &format!("{foreign} must never authenticate against community B"),
+            );
+        }
+    }
+
+    #[test]
+    fn nip98_alias_equal_to_the_canonical_scheme_does_not_duplicate_the_entry() {
+        let tenant = fresh_tenant("buzz.example");
+        let accepted = nip98_accepted_urls(
+            "wss://buzz.example",
+            &tenant,
+            &["wss".to_string()],
+            "/query",
+        );
+        assert_eq!(accepted, vec!["https://buzz.example/query".to_string()]);
+    }
+
+    /// The alias only ever widens the *scheme*; the path — including any
+    /// query string the moderation/workflow readers reconstruct — is carried
+    /// into every candidate verbatim, so an alias cannot loosen path binding.
+    #[test]
+    fn nip98_alias_candidates_carry_the_full_path_and_query() {
+        let tenant = fresh_tenant("buzz.example");
+        let accepted = nip98_accepted_urls(
+            "wss://buzz.example",
+            &tenant,
+            &["ws".to_string()],
+            "/moderation/reports?limit=20&status=open",
+        );
+        assert_eq!(
+            accepted,
+            vec![
+                "https://buzz.example/moderation/reports?limit=20&status=open".to_string(),
+                "http://buzz.example/moderation/reports?limit=20&status=open".to_string(),
+            ]
+        );
+        let keys = Keys::generate();
+        let event_json =
+            build_nip98_event_json(&keys, "http://buzz.example/moderation/reports", "GET");
+        let headers = nip98_auth_headers(&event_json);
+        let (status, _) = verify_bridge_auth(&headers, "GET", &accepted, None, true).expect_err(
+            "bare-path signature must not match a query-bearing candidate under any scheme",
+        );
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     /// Positive control: a NIP-42 AUTH event signed for host A MUST be
