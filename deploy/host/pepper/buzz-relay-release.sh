@@ -31,9 +31,17 @@ health_base=http://127.0.0.1:8080
 # tolerating a systematic lockout.
 max_auth_mismatch=3
 unit_name=buzz-relay.service
+# root-jljfy: refuse to swap a release whose runtime env cannot authenticate
+# to the object store. On 2026-09-20 the relay's S3 secret had silently drifted
+# from the MinIO container's; the startup git object-store conformance probe
+# then crash-looped both the candidate and the rollback target. Checking auth
+# *before* anything is staged or swapped turns that into a refused release.
+# BUZZ_RELAY_S3_PREFLIGHT overrides the preflight command (fixture tests only).
+s3_preflight=true
+s3_preflight_cmd=${BUZZ_RELAY_S3_PREFLIGHT:-}
 
 usage() {
-    printf '%s\n' 'usage: buzz-relay-release.sh --apply --source DIR --revision SHA [--restart]'
+    printf '%s\n' 'usage: buzz-relay-release.sh --apply --source DIR --revision SHA [--restart] [--skip-s3-preflight]'
 }
 
 while (($#)); do
@@ -43,6 +51,7 @@ while (($#)); do
         --restart) restart=true ;;
         --no-systemd) systemd=false ;;
         --no-verify) verify=false ;;
+        --skip-s3-preflight) s3_preflight=false ;;
         --root|--source|--revision|--env-source|--env-dest|--unit-dest|--soak-seconds|--health-base|--max-auth-mismatch|--unit-name)
             (($# >= 2)) || { usage >&2; exit 64; }
             case "$1" in
@@ -70,6 +79,24 @@ $apply || { usage >&2; exit 64; }
 installer_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 rollback_dir="$root/rollback"
 current="$root/current"
+
+# root-jljfy: prove that the runtime env this release would run with can
+# authenticate to the object store BEFORE anything is staged or swapped. The
+# environment is assembled as the launcher will see it (unit EnvironmentFile=
+# entries, then the runtime env source). The preflight prints status codes and
+# S3 error codes only — never values.
+run_s3_preflight() {
+    local cmd=${s3_preflight_cmd:-"$installer_dir/buzz-relay-s3-preflight.py"}
+    local args=(--env-file "$env_source")
+    if $systemd; then
+        args=(--unit "$unit_name" "${args[@]}")
+    fi
+    [[ -x "$cmd" ]] || { printf '%s\n' 'release refused: S3 preflight command is missing or not executable' >&2; exit 66; }
+    if ! "$cmd" "${args[@]}"; then
+        printf '%s\n' 'release refused: S3 auth preflight failed — the runtime env this release would run with cannot authenticate to the object store. Fix the credentials (Infisical render / relay.env) before swapping; --skip-s3-preflight is for non-production dry runs only.' >&2
+        exit 66
+    fi
+}
 
 install_unit() {
     install -D -m 0644 "$installer_dir/buzz-relay.service" "$unit_dest"
@@ -290,6 +317,12 @@ if git -C "$source_dir" rev-parse --verify HEAD >/dev/null 2>&1; then
     }
 fi
 
+if $s3_preflight; then
+    run_s3_preflight
+else
+    printf '%s\n' 'note: S3 auth preflight skipped (--skip-s3-preflight is for non-production dry runs only)' >&2
+fi
+
 release="$root/releases/$revision"
 if [[ -e "$release" ]]; then
     [[ -x "$release/target/release/buzz-relay" ]] || { printf '%s\n' 'release path exists but is incomplete' >&2; exit 66; }
@@ -304,6 +337,7 @@ else
     install -d -m 0755 "$stage/target/release" "$stage/deploy/host/pepper"
     install -m 0755 "$binary" "$stage/target/release/buzz-relay"
     install -m 0755 "$installer_dir/buzz-relay-launch.sh" "$stage/deploy/host/pepper/buzz-relay-launch.sh"
+    install -m 0755 "$installer_dir/buzz-relay-s3-preflight.py" "$stage/deploy/host/pepper/buzz-relay-s3-preflight.py"
     mkdir -p "$stage/web"
     cp -a "$source_dir/web/dist" "$stage/web/dist"
     binary_sha256=$(sha256sum "$stage/target/release/buzz-relay" | awk '{print $1}')

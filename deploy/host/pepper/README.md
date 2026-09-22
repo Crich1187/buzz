@@ -36,6 +36,29 @@ deploy/host/pepper/buzz-relay-release.sh \
 `--restart` triggers verification (below). Add `--no-verify` only for a
 non-production dry run — never to get past a failing soak.
 
+### S3 auth preflight
+
+Before anything is staged or swapped, `--apply` runs
+`buzz-relay-s3-preflight.py`: it assembles the environment exactly as the
+launcher will (the unit's `EnvironmentFile=` entries, then the runtime env
+source) and makes one SigV4-signed ListObjectsV2 call (`max-keys=1`) against
+the configured bucket. Credentials that cannot authenticate refuse the release
+with exit **66** instead of becoming a crash-looping relay — which is what
+happened on 2026-09-20, when the relay's S3 secret had drifted from the MinIO
+container's and the startup conformance probe took down both the candidate and
+the rollback target. Only status codes, S3 error codes and the endpoint host /
+bucket are printed. `--skip-s3-preflight` exists for non-production dry runs
+only; `--rollback` never runs the preflight, so a broken object store cannot
+block reverting. `BUZZ_RELAY_S3_PREFLIGHT=<command>` substitutes the preflight
+command and exists for the fixture tests only.
+
+The relay's S3 credentials are **not** in `relay.env`. On pepper they are
+rendered by the Infisical Agent to `/run/infisical/buzz-relay-s3.env` (from the
+same secrets that drive the MinIO container) and loaded by the host drop-in
+`/etc/systemd/system/buzz-relay.service.d/10-s3-creds.conf` (bead root-jljfy).
+Drop-ins are host configuration and survive releases; putting the keys back
+into `relay.env` would override the render at launch.
+
 ## The NIP-42 transport alias (required on this host)
 
 This relay is reachable two ways:
@@ -145,9 +168,12 @@ Under a live burst past that ceiling the relay sheds load as
 ```bash
 deploy/host/pepper/tests/test-buzz-relay-release.sh
 shellcheck -x deploy/host/pepper/*.sh deploy/host/pepper/tests/*.sh
+python3 -m py_compile deploy/host/pepper/buzz-relay-s3-preflight.py
 ```
 
 The fixture covers the release pointer, rollback of release + unit + env, the
 no-op-rollback refusal, legacy-unit capture, install ordering, launcher refusal
-without a release, the logging clamp, and that rollback metadata records
-revisions without leaking env values.
+without a release, the logging clamp, that rollback metadata records
+revisions without leaking env values, and the S3 auth preflight (refusal
+before any write, the skip flag, the rollback exemption, and the real
+preflight's value-safe verdicts against a local fake object store).

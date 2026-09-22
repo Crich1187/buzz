@@ -7,6 +7,7 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)
 installer="$repo_root/deploy/host/pepper/buzz-relay-release.sh"
 unit="$repo_root/deploy/host/pepper/buzz-relay.service"
 launcher="$repo_root/deploy/host/pepper/buzz-relay-launch.sh"
+preflight="$repo_root/deploy/host/pepper/buzz-relay-s3-preflight.py"
 
 test -x "$installer"
 test -f "$unit"
@@ -33,10 +34,25 @@ grep -Fq 'target/release/buzz-relay' "$launcher"
 tmp=$(mktemp -d)
 cleanup() {
     status=$?
+    [[ -n "${fake_pid:-}" ]] && kill "$fake_pid" 2>/dev/null
     rm -rf "$tmp"
     exit "$status"
 }
 trap cleanup EXIT
+# root-jljfy: every --apply runs the S3 auth preflight. The fixture has no
+# object store, so the harness substitutes recording stubs; the real preflight
+# is exercised against a local fake object store further down.
+fake_pid=
+preflight_ok="$tmp/preflight-ok.sh"
+preflight_fail="$tmp/preflight-fail.sh"
+preflight_log="$tmp/preflight.log"
+# The stubs must record their own "$*" at run time, so single quotes are deliberate.
+# shellcheck disable=SC2016
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >>"%s"\nexit 0\n' "$preflight_log" >"$preflight_ok"
+# shellcheck disable=SC2016
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >>"%s"\nexit 1\n' "$preflight_log" >"$preflight_fail"
+chmod 0755 "$preflight_ok" "$preflight_fail"
+export BUZZ_RELAY_S3_PREFLIGHT="$preflight_ok"
 source_a="$tmp/source-a"
 source_b="$tmp/source-b"
 root="$tmp/release-root"
@@ -284,6 +300,168 @@ grep -Eq '^previous_unit_backup=(yes|no)$' "$meta"
 # fixture's env values; their presence would mean the metadata leaks config.
 if grep -Fq 'EXAMPLE=' "$meta"; then exit 1; fi
 
+# ---------------------------------------------------------------------------
+# root-jljfy — the release refuses to swap when the runtime env cannot
+# authenticate to the object store.
+#
+# 2026-09-20: the relay's S3 secret had silently drifted from the MinIO
+# container's; the startup git object-store conformance probe then crash-looped
+# both the candidate and the rollback target (HTTP 403 SignatureDoesNotMatch).
+# Checking auth *before* the swap makes that a refused release instead.
+# ---------------------------------------------------------------------------
+test -x "$preflight"
+pf_root="$tmp/preflight-root"
+pf_env="$tmp/pf.env"
+pf_unit="$tmp/pf.service"
+
+# 1) A failing preflight refuses the release before any byte is written.
+set +e
+BUZZ_RELAY_S3_PREFLIGHT="$preflight_fail" \
+    "$installer" --apply --no-systemd --root "$pf_root" --source "$source_a" --revision alpha \
+    --env-source "$source_a/runtime.env" --env-dest "$pf_env" --unit-dest "$pf_unit" \
+    >"$tmp/pf.out" 2>"$tmp/pf.err"
+pf_rc=$?
+set -e
+test "$pf_rc" -eq 66
+grep -Fq 'S3 auth preflight failed' "$tmp/pf.err"
+test ! -e "$pf_root/current"
+test ! -e "$pf_root/releases/alpha"
+test ! -e "$pf_env"
+test ! -e "$pf_unit"
+
+# 2) The preflight is handed exactly the env source this release would
+#    install, and without systemd it must not try to introspect a unit.
+grep -Fq -- "--env-file $source_a/runtime.env" "$preflight_log"
+if grep -Fq -- '--unit' "$preflight_log"; then exit 1; fi
+
+# 3) --skip-s3-preflight bypasses it (dry runs only) and says so.
+BUZZ_RELAY_S3_PREFLIGHT="$preflight_fail" \
+    "$installer" --apply --no-systemd --skip-s3-preflight --root "$pf_root" --source "$source_a" \
+    --revision alpha --env-source "$source_a/runtime.env" --env-dest "$pf_env" --unit-dest "$pf_unit" \
+    2>"$tmp/pf-skip.err"
+test "$(readlink "$pf_root/current")" = "releases/alpha"
+grep -Fq 'S3 auth preflight skipped' "$tmp/pf-skip.err"
+
+# 4) Rollback never runs the preflight: a broken object store must not block
+#    reverting to the previous release.
+"$installer" --apply --no-systemd --root "$pf_root" --source "$source_b" --revision bravo \
+    --env-source "$source_b/runtime.env" --env-dest "$pf_env" --unit-dest "$pf_unit"
+: >"$preflight_log"
+BUZZ_RELAY_S3_PREFLIGHT="$preflight_fail" \
+    "$installer" --apply --no-systemd --root "$pf_root" --rollback --env-dest "$pf_env" --unit-dest "$pf_unit"
+test "$(readlink "$pf_root/current")" = "releases/alpha"
+test ! -s "$preflight_log"
+
+# 5) A missing preflight command is a refusal, not a silent pass.
+set +e
+BUZZ_RELAY_S3_PREFLIGHT="$tmp/no-such-preflight" \
+    "$installer" --apply --no-systemd --root "$tmp/pf-missing-root" --source "$source_a" --revision alpha \
+    --env-source "$source_a/runtime.env" --env-dest "$tmp/pf-missing.env" --unit-dest "$tmp/pf-missing.service" \
+    >/dev/null 2>"$tmp/pf-missing.err"
+pf_missing_rc=$?
+set -e
+test "$pf_missing_rc" -eq 66
+grep -Fq 'S3 preflight command is missing' "$tmp/pf-missing.err"
+test ! -e "$tmp/pf-missing-root/current"
+
+# 6) The real preflight against a local fake object store: it signs SigV4,
+#    reports verdicts by status/error code only, and never prints a secret.
+python3 -m py_compile "$preflight"
+fake_port_file="$tmp/fake-s3.port"
+python3 - "$fake_port_file" <<'PY' &
+import re, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+port_file = sys.argv[1]
+GOOD = "fixture-access-key"
+EMPTY_SHA = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+AUTH_RE = re.compile(r"^AWS4-HMAC-SHA256 Credential=([^/]+)/\d{8}/us-east-1/s3/aws4_request, "
+                     r"SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=[0-9a-f]{64}$")
+BODY_403 = (b'<?xml version="1.0" encoding="UTF-8"?><Error><Code>SignatureDoesNotMatch</Code>'
+            b'<Message>The request signature we calculated does not match</Message></Error>')
+BODY_200 = b'<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><KeyCount>0</KeyCount></ListBucketResult>'
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+    def do_GET(self):
+        # Shape-checks the SigV4 authorization (credential scope, signed
+        # headers, 64-hex signature, empty-payload hash); it does not recompute
+        # the HMAC — the live MinIO 200/403 run covers signature correctness.
+        auth = self.headers.get("Authorization", "")
+        match = AUTH_RE.match(auth)
+        ok = (match is not None and match.group(1) == GOOD
+              and self.headers.get("x-amz-content-sha256") == EMPTY_SHA
+              and bool(self.headers.get("x-amz-date"))
+              and self.path == "/fixture/?list-type=2&max-keys=1")
+        body = BODY_200 if ok else BODY_403
+        self.send_response(200 if ok else 403)
+        self.send_header("Content-Type", "application/xml")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+server = HTTPServer(("127.0.0.1", 0), Handler)
+with open(port_file, "w") as handle:
+    handle.write(str(server.server_port))
+server.serve_forever()
+PY
+fake_pid=$!
+for _ in $(seq 1 50); do [[ -s "$fake_port_file" ]] && break; sleep 0.1; done
+test -s "$fake_port_file"
+fake_port=$(<"$fake_port_file")
+printf 'BUZZ_S3_ENDPOINT=http://127.0.0.1:%s\nBUZZ_S3_BUCKET=fixture\nBUZZ_S3_REGION=us-east-1\nBUZZ_S3_ADDRESSING_STYLE=path\n' \
+    "$fake_port" >"$tmp/s3-base.env"
+printf 'BUZZ_S3_ACCESS_KEY="fixture-access-key"\nBUZZ_S3_SECRET_KEY="fixture-secret-value"\n' >"$tmp/s3-good.env"
+printf 'BUZZ_S3_ACCESS_KEY=stale-access-key\nBUZZ_S3_SECRET_KEY=stale-secret-value\n' >"$tmp/s3-stale.env"
+
+# Good credentials -> authenticated, exit 0.
+"$preflight" --env-file "$tmp/s3-base.env" --env-file "$tmp/s3-good.env" >"$tmp/s3-good.out" 2>"$tmp/s3-good.err"
+grep -Fq 's3 preflight ok' "$tmp/s3-good.out"
+grep -Fq 'http=200' "$tmp/s3-good.out"
+
+# Stale credentials -> rejected with the S3 error code, exit 1, no value echoed.
+set +e
+"$preflight" --env-file "$tmp/s3-base.env" --env-file "$tmp/s3-stale.env" >"$tmp/s3-stale.out" 2>"$tmp/s3-stale.err"
+s3_stale_rc=$?
+set -e
+test "$s3_stale_rc" -eq 1
+grep -Fq 'http=403' "$tmp/s3-stale.err"
+grep -Fq 'code=SignatureDoesNotMatch' "$tmp/s3-stale.err"
+if grep -Fq 'stale-secret-value' "$tmp/s3-stale.out" "$tmp/s3-stale.err"; then exit 1; fi
+if grep -Fq 'stale-access-key' "$tmp/s3-stale.out" "$tmp/s3-stale.err"; then exit 1; fi
+
+# Later env files override earlier ones, exactly like `set -a; source` at launch.
+set +e
+"$preflight" --env-file "$tmp/s3-base.env" --env-file "$tmp/s3-good.env" --env-file "$tmp/s3-stale.env" \
+    >/dev/null 2>&1
+s3_order_rc=$?
+set -e
+test "$s3_order_rc" -eq 1
+
+# Unit EnvironmentFile= entries are honoured (via `systemctl cat`), optional
+# ones may be absent, and they sit BELOW the runtime env file: on pepper the
+# host drop-in supplies the keys and relay.env the rest.
+shim="$tmp/shim"
+mkdir -p "$shim"
+printf '[Service]\nEnvironmentFile=-%s\nEnvironmentFile=%s\n' "$tmp/does-not-exist.env" "$tmp/s3-good.env" \
+    >"$tmp/fake-unit.txt"
+# The shim must see its own "$1" at run time, so single quotes are deliberate.
+# shellcheck disable=SC2016
+printf '#!/usr/bin/env bash\n[[ "$1" = cat ]] && cat "%s"\n' "$tmp/fake-unit.txt" >"$shim/systemctl"
+chmod 0755 "$shim/systemctl"
+PATH="$shim:$PATH" "$preflight" --unit fake.service --env-file "$tmp/s3-base.env" >"$tmp/s3-unit.out" 2>&1
+grep -Fq 's3 preflight ok' "$tmp/s3-unit.out"
+
+# Missing configuration is a configuration error (exit 2) that names keys only.
+set +e
+"$preflight" --env-file "$tmp/s3-base.env" >/dev/null 2>"$tmp/s3-missing.err"
+s3_missing_rc=$?
+set -e
+test "$s3_missing_rc" -eq 2
+grep -Fq 'BUZZ_S3_ACCESS_KEY' "$tmp/s3-missing.err"
+
+kill "$fake_pid" 2>/dev/null || true
+wait "$fake_pid" 2>/dev/null || true
+fake_pid=
+
 printf 'PASS: release pointer and rollback contract\n'
 printf 'PASS: unit/launcher fail closed without an immutable release\n'
 printf 'PASS: NIP-42 transport alias declared as a bounded scheme list\n'
@@ -291,3 +469,4 @@ printf 'PASS: launcher clamps production logging unless explicitly opted out\n'
 printf 'PASS: no-op rollback refuses instead of reporting success\n'
 printf 'PASS: unit and env are preserved and restored across rollback\n'
 printf 'PASS: rollback metadata is recorded and value-safe\n'
+printf 'PASS: S3 auth preflight gates the release swap and is value-safe\n'
